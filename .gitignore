@@ -1,1 +1,38 @@
 project_specs.md
+
+# Dataset — nuScenes is too large for git
+data/
+
+# Model artifacts
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.engine
+*.trt
+
+# C++ build output
+inference/build/
+
+# Experiment outputs
+experiments/*/logs/
+experiments/*/results/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Wandb / TensorBoard
+wandb/
+runs/
