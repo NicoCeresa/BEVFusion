@@ -1,4 +1,8 @@
 project_specs.md
+paper_notes.md
+*.pdf
+.bevfusion_env/
+config*.yaml
 
 # Dataset — nuScenes is too large for git
 data/
