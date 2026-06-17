@@ -48,24 +48,64 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
+## Lift, Splat, Shoot (LSS)
+
+LSS is the camera-to-BEV transformation at the core of BEVFusion's camera branch. It solves the problem of converting 2D perspective camera images into the 3D bird's-eye view space where LiDAR features live.
+
+### How it works
+
+**Lift** — For each pixel in the camera feature map, a depth distribution is predicted over D discrete depth bins. Each pixel is then "lifted" into 3D space by placing a feature vector at every depth along its camera ray, weighted by the predicted depth probability. This produces a 3D feature volume of size `(N×H×W×D, C)`.
+
+**Splat** — The 3D feature volume is projected into the ego vehicle's coordinate frame using the camera intrinsics and extrinsics, then pooled into a 2D BEV grid by aggregating all features that fall within each grid cell and collapsing the Z axis.
+
+**Shoot** — In the original LSS paper, a planning head consumes the BEV features to predict future ego trajectories. In BEVFusion this is replaced by the fusion encoder and task-specific heads.
+
+### Where LSS fits in BEVFusion
+
+```
+Camera Images (6x)
+        │
+        ▼
+  EfficientNet-b0          ← feature extraction (semantic encoder)
+        │
+        ▼
+   Depth Network           ← predicts depth distribution per pixel
+        │
+        ▼
+   BEV Pooling             ← lifts features to 3D, splats into BEV grid
+        │
+        ▼
+Camera BEV Features  ──────────────────────────────┐
+                                                    ▼
+LiDAR Point Cloud ──► PointPillars ──► LiDAR BEV ──► Fusion Encoder ──► Task Heads
+```
+
+LSS produces the camera BEV feature map. BEVFusion fuses it with the LiDAR BEV map and runs it through shared task heads for detection and segmentation.
+
+### LSS output on nuScenes mini
+
+Camera inputs (6 views) and the resulting BEV feature map from the pretrained LSS model:
+
+![LSS BEV Output](images/lss_output.png)
+
 ## Project structure
 
 ```
-bevfusion/
-├── data/           # nuScenes dataset, voxelization, augmentation
-├── models/         # Camera encoder, LiDAR encoder, fusion head, detection head
-├── tracking/       # Kalman filter tracker
-├── inference/      # C++ TensorRT engine and inference wrapper
-├── eval/           # mAP/NDS metrics and BEV visualization
-├── configs/        # Training hyperparameters
-├── train.py
-└── export_onnx.py
+BEVFusion/
+├── config.yaml
+├── images/             # visualizations
+├── scripts/            # runnable scripts
+│   ├── read_nuscenes.py
+│   └── run_lss.py
+└── src/
+    ├── backbones/      # LSS model and tools
+    └── view_transform/ # camera-to-BEV transformation
 ```
 
 ## Key papers
 
-- [BEVFusion](https://arxiv.org/abs/2205.13542) — Liang et al., 2022 (primary reference)
-- [PointPillars](https://arxiv.org/abs/1812.05784) — Lang et al., 2019
+- [BEVFusion](https://arxiv.org/abs/2205.13542) — Liu et al., 2022 (primary reference)
 - [Lift, Splat, Shoot](https://arxiv.org/abs/2008.05711) — Philion & Fidler, 2020
+- [PointPillars](https://arxiv.org/abs/1812.05784) — Lang et al., 2019
 - [Swin Transformer](https://arxiv.org/abs/2103.14030) — Liu et al., 2021
 - [CenterPoint](https://arxiv.org/abs/2006.11275) — Yin et al., 2021

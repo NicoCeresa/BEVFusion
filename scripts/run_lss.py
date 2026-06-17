@@ -76,7 +76,7 @@ def main():
 
     print(f"BEV output shape: {bev.shape}")
 
-    out_path = Path(__file__).parent.parent / "images" / "bev_output.png"
+    out_path = Path(__file__).parent.parent / "images" / "lss_output.png"
 
     # top row: 6 camera images, bottom row: BEV output
     fig = plt.figure(figsize=(18, 8))
