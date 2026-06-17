@@ -61,7 +61,7 @@ def get_sample_inputs(nusc, sample):
     )
 
 
-if __name__ == "__main__":
+def main():
     nusc = NuScenes(version=cfg["data"]["version"], dataroot=cfg["data"]["root"], verbose=False)
 
     model = compile_model(GRID_CONF, DATA_AUG_CONF, outC=1)
@@ -96,3 +96,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(out_path)
     print(f"Saved {out_path}")
+
+
+if __name__ == "__main__":
+    main()
