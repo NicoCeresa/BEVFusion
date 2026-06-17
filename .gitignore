@@ -1,6 +1,5 @@
 project_specs.md
-paper_notes.md
-*.pdf
+notes/
 .bevfusion_env/
 config*.yaml
 
