@@ -2,6 +2,7 @@ project_specs.md
 notes/
 .bevfusion_env/
 config*.yaml
+CLAUDE.md
 
 # Dataset — nuScenes is too large for git
 data/
