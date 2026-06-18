@@ -53,4 +53,4 @@ class PillarBackbone(nn.Module):
         out_2b = self.deconv_2b(out_2a)
         out_3b = self.deconv_3b(out_3a)
 
-        return torch.cat([out_1b, out_2b, out_3b], dim=1)  # (6C, H/2, W/2)
+        return torch.cat([out_1b, out_2b, out_3b], dim=1)
