@@ -1,78 +1,89 @@
-"""
-Code from PointPillar Implementation
-"""
+# Source: Lang et al., "PointPillars: Fast Encoders for Object Detection from Point Clouds," CVPR 2019.
+# Converts a raw LiDAR point cloud into a dense pillar tensor ready for PointNet encoding.
+
 import torch
-from torch import nn
+
 
 def discretize_point_cloud(points: torch.Tensor, voxel_size: tuple, point_cloud_range: tuple):
     """
-    Discretize the point cloud into pillars.
+    Assign each point to a pillar grid cell.
 
-    Args:
-        points (torch.Tensor): The input point cloud of shape (N, 3) where N is the number of points.
-        voxel_size (tuple): The size of each voxel in the format (x_size, y_size, z_size).
-        point_cloud_range (tuple): The range of the point cloud in the format ((x_min, x_max), (y_min, y_max), (z_min, z_max)).
+    points: (N, 4) — x, y, z, intensity
+    voxel_size: (x_size, y_size, z_size)
+    point_cloud_range: ((x_min, x_max), (y_min, y_max), (z_min, z_max))
 
-    Returns:
-        torch.Tensor: A tensor containing the pillar indices for each point.
+    returns: (N, 2) pillar grid indices (ix, iy) per point
     """
-    (x_min, x_max), (y_min, y_max), (z_min, z_max) = point_cloud_range
-    x_size, y_size, z_size = voxel_size
+    (x_min, _), (y_min, _), _ = point_cloud_range
+    x_size, y_size, _ = voxel_size
 
     ix = ((points[:, 0] - x_min) / x_size).floor().long()
     iy = ((points[:, 1] - y_min) / y_size).floor().long()
-    iz = ((points[:, 2] - z_min) / z_size).floor().long()
 
-    pillar_indices = torch.stack((ix, iy), dim=1)
+    return torch.stack((ix, iy), dim=1)
 
-    return pillar_indices
 
 def get_pillar_centers(pillar_indices: torch.Tensor, voxel_size: tuple, point_cloud_range: tuple):
     """
-    Calculate the centers of the pillars based on their indices.
+    Compute the geometric center (x, y) of each pillar from its grid index.
 
-    Args:
-        pillar_indices (torch.Tensor): The indices of the pillars for each point.
-        voxel_size (tuple): The size of each voxel in the format (x_size, y_size, z_size).
-        point_cloud_range (tuple): The range of the point cloud in the format ((x_min, x_max), (y_min, y_max), (z_min, z_max)).
-
-    Returns:
-        torch.Tensor: A tensor containing the center coordinates of each pillar.
+    pillar_indices: (N, 2) — (ix, iy) per point
+    returns: (N, 2) — (x_center, y_center) in ego-frame meters per point
     """
-    (x_min, x_max), (y_min, y_max), (z_min, z_max) = point_cloud_range
-    x_size, y_size, z_size = voxel_size
+    (x_min, _), (y_min, _), _ = point_cloud_range
+    x_size, y_size, _ = voxel_size
 
-    pillar_centers_x = x_min + (pillar_indices[:, 0] + 0.5) * x_size
-    pillar_centers_y = y_min + (pillar_indices[:, 1] + 0.5) * y_size
+    cx = x_min + (pillar_indices[:, 0] + 0.5) * x_size
+    cy = y_min + (pillar_indices[:, 1] + 0.5) * y_size
 
-    pillar_centers = torch.stack((pillar_centers_x, pillar_centers_y), dim=1)
+    return torch.stack((cx, cy), dim=1)
 
-    return pillar_centers
 
-def augment_pillars(points: torch.Tensor, pillar_centers: torch.Tensor):
+def augment_pillars(points: torch.Tensor, pillar_centers: torch.Tensor, cluster_centers: torch.Tensor):
     """
-    - points in each pillar augmented w/ x_c, y_c, z_c, x_p, and y_p
-    - c subscript is distance to arithmetic mean of all point in pillar
-    - p subscript denotes offset from the pillar x,y center
-    - augmented lidar point l is now D = 9 dimensional
+    Augment each point with offset features as described in the PointPillars paper.
 
-    Args:
-        points (torch.Tensor): The input point cloud of shape (N, 3) where N is the number of points.
-        pillar_centers (torch.Tensor): The center coordinates of each pillar.
+    x_c, y_c, z_c — offset from the arithmetic mean of all points in the pillar (cluster centroid)
+    x_p, y_p      — offset from the geometric pillar center
 
-    Returns:
-        torch.Tensor: A tensor containing the augmented point features.
+    points:          (N, 4) — x, y, z, intensity
+    pillar_centers:  (N, 2) — geometric pillar center per point
+    cluster_centers: (N, 3) — mean x, y, z of all points in the pillar per point
+
+    returns: (N, 9)
     """
-    x_c = points[:, 0] - pillar_centers[:, 0]
-    y_c = points[:, 1] - pillar_centers[:, 1]
-    z_c = points[:, 2] - pillar_centers[:, 2]
+    x_c = points[:, 0] - cluster_centers[:, 0]
+    y_c = points[:, 1] - cluster_centers[:, 1]
+    z_c = points[:, 2] - cluster_centers[:, 2]
 
     x_p = points[:, 0] - pillar_centers[:, 0]
     y_p = points[:, 1] - pillar_centers[:, 1]
 
-    augmented_points = torch.cat((points, x_c.unsqueeze(1), y_c.unsqueeze(1), z_c.unsqueeze(1), x_p.unsqueeze(1), y_p.unsqueeze(1)), dim=1)
+    return torch.cat([
+        points,
+        x_c.unsqueeze(1), y_c.unsqueeze(1), z_c.unsqueeze(1),
+        x_p.unsqueeze(1), y_p.unsqueeze(1),
+    ], dim=1)
 
-    return augmented_points
 
-class PointPillars(nn.Module):
-    pass
+def optimize_pillars(points: torch.Tensor, pillar_indices: torch.Tensor, max_points_per_pillar: int):
+    """
+    Group points into pillars and pad/truncate to a fixed size.
+
+    points:         (N, 9) — augmented point features
+    pillar_indices: (N, 2) — (ix, iy) grid index per point
+    max_points_per_pillar: fixed pillar size N
+
+    returns:
+        pillar_features: (P, N, 9)
+        unique_indices:  (P, 2) — (ix, iy) per pillar
+    """
+    unique_indices, inverse = torch.unique(pillar_indices, dim=0, return_inverse=True)
+    P = unique_indices.shape[0]
+    pillar_features = torch.zeros(P, max_points_per_pillar, points.shape[1], device=points.device)
+
+    for i in range(P):
+        pts = points[inverse == i][:max_points_per_pillar]
+        pillar_features[i, :pts.shape[0]] = pts
+
+    return pillar_features, unique_indices
