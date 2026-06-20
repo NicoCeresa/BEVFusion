@@ -16,10 +16,10 @@ with open(CONFIG_PATH) as f:
     cfg = yaml.safe_load(f)
 
 GRID_CONF = {
-    'xbound': [-50.0, 50.0, 0.5],
-    'ybound': [-50.0, 50.0, 0.5],
-    'zbound': [-10.0, 10.0, 20.0],
-    'dbound': [4.0, 45.0, 1.0],
+    'xbound': cfg['camera']['xbound'],
+    'ybound': cfg['camera']['ybound'],
+    'zbound': cfg['camera']['zbound'],
+    'dbound': cfg['camera']['dbound'],
 }
 DATA_AUG_CONF = {'final_dim': (128, 352)}
 

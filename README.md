@@ -152,6 +152,10 @@ Camera inputs (6 views) and the resulting BEV feature map:
 
 ![LSS BEV Output](images/lss_output.png)
 
+## Limitations
+
+**BEV grid alignment** — The BEVFusion paper trains both camera and LiDAR branches jointly from scratch with a shared BEV grid, ensuring spatial alignment by design. This implementation uses pretrained LSS weights from the official LSS repository (Philion & Fidler), which were trained on a fixed 200×200 grid at 0.5m resolution covering ±50m. As a result, the LiDAR branch is configured to match this grid rather than the grid used in the original BEVFusion paper. A proper reproduction would train both branches jointly on the same grid.
+
 ## Key papers
 
 - [BEVFusion](https://arxiv.org/abs/2205.13542) — Liang et al., 2022 (primary architecture reference)
