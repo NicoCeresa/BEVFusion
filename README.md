@@ -22,7 +22,7 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 | 2 | Camera encoder: LSS BEV projection | ✅ Done |
 | 3 | LiDAR encoder: PointPillars | ✅ Done |
 | 4 | BEV fusion encoder + detection head | ✅ Done |
-| 5 | Data loader + loss function + training | 🔲 Planned |
+| 5 | Data loader + loss function + training | ✅ Done |
 | 6 | C++ TensorRT inference engine | 🔲 Planned |
 
 ## Project structure
@@ -168,6 +168,12 @@ Raw LiDAR point cloud encoded into a 200×200 BEV grid via pillarization and Poi
 Camera and LiDAR BEV features concatenated and refined by the convolutional BEV encoder, then passed through the detection head. The fused BEV combines geometric structure from LiDAR with semantic density from cameras.
 
 ![BEVFusion Output](images/bevfusion_output.png)
+
+### Detection Output
+
+10-sample inference loop after training. Background is colored by LiDAR point height (purple = ground, yellow = rooftop). Solid colored boxes are model predictions (blue = car, green = pedestrian, red = bicycle); dashed white boxes are ground truth annotations.
+
+![Detection Results](images/test_results.gif)
 
 ## Limitations
 
