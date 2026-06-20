@@ -32,24 +32,16 @@ def main():
     print(f"LiDAR points: {points.shape}")
 
     with torch.no_grad():
-        cls, reg = model(points)
+        bev = model(points)
 
-    print(f"cls: {cls.shape}")
-    print(f"reg: {reg.shape}")
+    print(f"bev: {bev.shape}")
 
     out_path = Path(__file__).parent.parent / "images" / "point_pillars_output.png"
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    axes[0].imshow(cls[0].max(dim=0).values.numpy(), origin='lower', cmap='inferno')
-    axes[0].set_title("Classification (max over anchors)")
-    plt.colorbar(axes[0].images[0], ax=axes[0])
-
-    axes[1].imshow(reg[0, :7].norm(dim=0).numpy(), origin='lower', cmap='viridis')
-    axes[1].set_title("Regression (box vector norm)")
-    plt.colorbar(axes[1].images[0], ax=axes[1])
-
-    plt.suptitle("PointPillars BEV Output")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(bev[0].max(dim=0).values.numpy(), origin='lower', cmap='inferno')
+    ax.set_title("PointPillars BEV Output")
+    plt.colorbar(im, ax=ax)
     plt.tight_layout()
     plt.savefig(out_path)
     print(f"Saved {out_path}")

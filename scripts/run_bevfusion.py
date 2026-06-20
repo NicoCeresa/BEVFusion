@@ -81,22 +81,10 @@ def main():
 
     out_path = Path(__file__).parent.parent / "images" / "bevfusion_output.png"
 
-    fig = plt.figure(figsize=(18, 10))
-
-    for i, cam in enumerate(CAMERAS):
-        cam_data = nusc.get('sample_data', sample['data'][cam])
-        img = Image.open(Path(nusc.dataroot) / cam_data['filename'])
-        ax = fig.add_subplot(2, 6, i + 1)
-        ax.imshow(img)
-        ax.set_title(cam.replace('CAM_', ''), fontsize=7)
-        ax.axis('off')
-
-    ax_bev = fig.add_subplot(2, 1, 2)
-    ax_bev.imshow(cls[0].max(dim=0).values.numpy(), origin='lower', cmap='inferno')
-    ax_bev.set_title("Fused BEV")
-    plt.colorbar(ax_bev.images[0], ax=ax_bev)
-
-    plt.suptitle("BEVFusion Output", fontsize=12)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(cls[0].max(dim=0).values.numpy(), origin='lower', cmap='inferno')
+    ax.set_title("Fused BEV Output")
+    plt.colorbar(im, ax=ax)
     plt.tight_layout()
     plt.savefig(out_path)
     print(f"Saved {out_path}")

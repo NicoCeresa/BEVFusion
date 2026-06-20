@@ -20,9 +20,10 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 |-------|-------------|--------|
 | 1 | nuScenes data pipeline + coordinate transforms | ✅ Done |
 | 2 | Camera encoder: LSS BEV projection | ✅ Done |
-| 3 | LiDAR encoder: PointPillars | 🔲 Planned |
-| 4 | Fusion head + 3D detection decoder | 🔲 Planned |
-| 5 | C++ TensorRT inference engine | 🔲 Planned |
+| 3 | LiDAR encoder: PointPillars | ✅ Done |
+| 4 | BEV fusion encoder + detection head | ✅ Done |
+| 5 | Data loader + loss function + training | 🔲 Planned |
+| 6 | C++ TensorRT inference engine | 🔲 Planned |
 
 ## Project structure
 
@@ -146,15 +147,15 @@ reduction_5: 320ch,  H/32  ← full semantic context, large receptive field
 
 LSS merges `reduction_5` (what a pixel means — semantic richness, broad context) with `reduction_4` (where exactly it is — spatial precision at the target resolution `H/16`). Earlier reductions encode only low-level features that carry almost no depth signal. The later reductions have the semantic content — object identity, relative scale, position relative to the horizon — that correlates with depth.
 
-### BEV output on nuScenes mini
-
-Camera inputs (6 views) and the resulting BEV feature map:
-
-![LSS BEV Output](images/lss_output.png)
-
 ## Pipeline Outputs
 
 All outputs below are from an **untrained model** on a single nuScenes mini sample. Spatial structure visible in the BEV maps comes from the input data, not learned weights — the camera branch uses pretrained LSS weights, while the LiDAR branch and fusion layer are randomly initialized.
+
+### Sensor Inputs
+
+6 synchronized camera views from the nuScenes mini dataset used as input to the camera branch.
+
+![Camera Inputs](images/camera_inputs.png)
 
 ### Camera BEV (LSS)
 
@@ -164,7 +165,7 @@ All outputs below are from an **untrained model** on a single nuScenes mini samp
 
 ### LiDAR BEV (PointPillars)
 
-Raw LiDAR point cloud encoded into a 200×200 BEV grid via pillarization and PointNet encoding. The left map shows classification scores, right shows the regression vector norm. Structure reflects LiDAR point density — denser around the ego vehicle and along road surfaces.
+Raw LiDAR point cloud encoded into a 200×200 BEV grid via pillarization and PointNet encoding. Structure reflects LiDAR point density — denser around the ego vehicle and along road surfaces.
 
 ![PointPillars Output](images/point_pillars_output.png)
 

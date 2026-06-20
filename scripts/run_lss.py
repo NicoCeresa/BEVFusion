@@ -76,26 +76,29 @@ def main():
 
     print(f"BEV output shape: {bev.shape}")
 
-    out_path = Path(__file__).parent.parent / "images" / "lss_output.png"
+    images_dir = Path(__file__).parent.parent / "images"
 
-    # top row: 6 camera images, bottom row: BEV output
-    fig = plt.figure(figsize=(18, 8))
+    # save camera inputs once as a shared reference image
+    fig, axes = plt.subplots(1, 6, figsize=(18, 3))
     for i, cam in enumerate(CAMERAS):
         cam_data = nusc.get('sample_data', sample['data'][cam])
         img = Image.open(Path(nusc.dataroot) / cam_data['filename'])
-        ax = fig.add_subplot(2, 6, i + 1)
-        ax.imshow(img)
-        ax.set_title(cam.replace('CAM_', ''), fontsize=8)
-        ax.axis('off')
-
-    ax_bev = fig.add_subplot(2, 1, 2)
-    ax_bev.imshow(bev[0, 0].numpy(), origin='lower', cmap='inferno')
-    ax_bev.set_title("LSS BEV Output")
-    plt.colorbar(ax_bev.images[0], ax=ax_bev)
-
+        axes[i].imshow(img)
+        axes[i].set_title(cam.replace('CAM_', ''), fontsize=8)
+        axes[i].axis('off')
     plt.tight_layout()
-    plt.savefig(out_path)
-    print(f"Saved {out_path}")
+    plt.savefig(images_dir / "camera_inputs.png")
+    print(f"Saved camera_inputs.png")
+    plt.close()
+
+    # save LSS BEV standalone
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(bev[0, 0].numpy(), origin='lower', cmap='inferno')
+    ax.set_title("LSS BEV Output")
+    plt.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.savefig(images_dir / "lss_output.png")
+    print(f"Saved lss_output.png")
 
 
 if __name__ == "__main__":
