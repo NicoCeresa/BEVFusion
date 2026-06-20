@@ -73,6 +73,40 @@ python scripts/read_nuscenes.py  # explore dataset structure
 | LiDAR-only baseline | ~50% | ~58% |
 | BEVFusion (fused) | ~67% | ~71% |
 
+## Pipeline Outputs
+
+All outputs below are from an **untrained model** on a single nuScenes mini sample. Spatial structure visible in the BEV maps comes from the input data, not learned weights — the camera branch uses pretrained LSS weights, while the LiDAR branch and fusion layer are randomly initialized.
+
+### Sensor Inputs
+
+6 synchronized camera views from the nuScenes mini dataset used as input to the camera branch.
+
+![Camera Inputs](images/camera_inputs.png)
+
+### Camera BEV (LSS)
+
+6 camera views lifted into a 200×200 BEV grid using the pretrained LSS model. Brighter regions correspond to areas where the depth network placed higher-confidence features.
+
+![LSS Output](images/lss_output.png)
+
+### LiDAR BEV (PointPillars)
+
+Raw LiDAR point cloud encoded into a 200×200 BEV grid via pillarization and PointNet encoding. Structure reflects LiDAR point density — denser around the ego vehicle and along road surfaces.
+
+![PointPillars Output](images/point_pillars_output.png)
+
+### Fused BEV (BEVFusion)
+
+Camera and LiDAR BEV features concatenated and refined by the convolutional BEV encoder, then passed through the detection head. The fused BEV combines geometric structure from LiDAR with semantic density from cameras.
+
+![BEVFusion Output](images/bevfusion_output.png)
+
+### Detection Output
+
+10-sample inference loop after training. Background is colored by LiDAR point height (purple = ground, yellow = rooftop). Solid colored boxes are model predictions (blue = car, green = pedestrian, red = bicycle); dashed white boxes are ground truth annotations.
+
+![Detection Results](images/test_results.gif)
+
 ## Lift, Splat, Shoot (LSS)
 
 LSS is the camera-to-BEV transformation at the core of BEVFusion's camera branch. It converts 2D perspective images from all 6 cameras into a single top-down BEV feature map in ego-frame meters.
@@ -140,40 +174,6 @@ reduction_5: 320ch,  H/32  ← full semantic context, large receptive field
 ```
 
 LSS merges `reduction_5` (what a pixel means — semantic richness, broad context) with `reduction_4` (where exactly it is — spatial precision at the target resolution `H/16`). Earlier reductions encode only low-level features that carry almost no depth signal. The later reductions have the semantic content — object identity, relative scale, position relative to the horizon — that correlates with depth.
-
-## Pipeline Outputs
-
-All outputs below are from an **untrained model** on a single nuScenes mini sample. Spatial structure visible in the BEV maps comes from the input data, not learned weights — the camera branch uses pretrained LSS weights, while the LiDAR branch and fusion layer are randomly initialized.
-
-### Sensor Inputs
-
-6 synchronized camera views from the nuScenes mini dataset used as input to the camera branch.
-
-![Camera Inputs](images/camera_inputs.png)
-
-### Camera BEV (LSS)
-
-6 camera views lifted into a 200×200 BEV grid using the pretrained LSS model. Brighter regions correspond to areas where the depth network placed higher-confidence features.
-
-![LSS Output](images/lss_output.png)
-
-### LiDAR BEV (PointPillars)
-
-Raw LiDAR point cloud encoded into a 200×200 BEV grid via pillarization and PointNet encoding. Structure reflects LiDAR point density — denser around the ego vehicle and along road surfaces.
-
-![PointPillars Output](images/point_pillars_output.png)
-
-### Fused BEV (BEVFusion)
-
-Camera and LiDAR BEV features concatenated and refined by the convolutional BEV encoder, then passed through the detection head. The fused BEV combines geometric structure from LiDAR with semantic density from cameras.
-
-![BEVFusion Output](images/bevfusion_output.png)
-
-### Detection Output
-
-10-sample inference loop after training. Background is colored by LiDAR point height (purple = ground, yellow = rooftop). Solid colored boxes are model predictions (blue = car, green = pedestrian, red = bicycle); dashed white boxes are ground truth annotations.
-
-![Detection Results](images/test_results.gif)
 
 ## Limitations
 
