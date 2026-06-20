@@ -81,25 +81,20 @@ def main():
 
     out_path = Path(__file__).parent.parent / "images" / "bevfusion_output.png"
 
-    fig = plt.figure(figsize=(18, 12))
+    fig = plt.figure(figsize=(18, 10))
 
     for i, cam in enumerate(CAMERAS):
         cam_data = nusc.get('sample_data', sample['data'][cam])
         img = Image.open(Path(nusc.dataroot) / cam_data['filename'])
-        ax = fig.add_subplot(3, 6, i + 1)
+        ax = fig.add_subplot(2, 6, i + 1)
         ax.imshow(img)
         ax.set_title(cam.replace('CAM_', ''), fontsize=7)
         ax.axis('off')
 
-    ax_cls = fig.add_subplot(3, 2, 3)
-    ax_cls.imshow(cls[0].max(dim=0).values.numpy(), origin='lower', cmap='inferno')
-    ax_cls.set_title("Fused BEV — Classification")
-    plt.colorbar(ax_cls.images[0], ax=ax_cls)
-
-    ax_reg = fig.add_subplot(3, 2, 4)
-    ax_reg.imshow(reg[0, :7].norm(dim=0).numpy(), origin='lower', cmap='viridis')
-    ax_reg.set_title("Fused BEV — Regression")
-    plt.colorbar(ax_reg.images[0], ax=ax_reg)
+    ax_bev = fig.add_subplot(2, 1, 2)
+    ax_bev.imshow(cls[0].max(dim=0).values.numpy(), origin='lower', cmap='inferno')
+    ax_bev.set_title("Fused BEV")
+    plt.colorbar(ax_bev.images[0], ax=ax_bev)
 
     plt.suptitle("BEVFusion Output", fontsize=12)
     plt.tight_layout()

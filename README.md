@@ -152,6 +152,28 @@ Camera inputs (6 views) and the resulting BEV feature map:
 
 ![LSS BEV Output](images/lss_output.png)
 
+## Pipeline Outputs
+
+All outputs below are from an **untrained model** on a single nuScenes mini sample. Spatial structure visible in the BEV maps comes from the input data, not learned weights — the camera branch uses pretrained LSS weights, while the LiDAR branch and fusion layer are randomly initialized.
+
+### Camera BEV (LSS)
+
+6 camera views lifted into a 200×200 BEV grid using the pretrained LSS model. Brighter regions correspond to areas where the depth network placed higher-confidence features.
+
+![LSS Output](images/lss_output.png)
+
+### LiDAR BEV (PointPillars)
+
+Raw LiDAR point cloud encoded into a 200×200 BEV grid via pillarization and PointNet encoding. The left map shows classification scores, right shows the regression vector norm. Structure reflects LiDAR point density — denser around the ego vehicle and along road surfaces.
+
+![PointPillars Output](images/point_pillars_output.png)
+
+### Fused BEV (BEVFusion)
+
+Camera and LiDAR BEV features concatenated and refined by the convolutional BEV encoder, then passed through the detection head. The fused BEV combines geometric structure from LiDAR with semantic density from cameras.
+
+![BEVFusion Output](images/bevfusion_output.png)
+
 ## Limitations
 
 **BEV grid alignment** — The BEVFusion paper trains both camera and LiDAR branches jointly from scratch with a shared BEV grid, ensuring spatial alignment by design. This implementation uses pretrained LSS weights from the official LSS repository (Philion & Fidler), which were trained on a fixed 200×200 grid at 0.5m resolution covering ±50m. As a result, the LiDAR branch is configured to match this grid rather than the grid used in the original BEVFusion paper. A proper reproduction would train both branches jointly on the same grid.
