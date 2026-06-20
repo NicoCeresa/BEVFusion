@@ -29,33 +29,27 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 
 ```
 BEVFusion/
+├── config.yaml
 ├── src/
-│   └── backbones/
-│       ├── lss_model.py        # LiftSplatShoot, CamEncode, BevEncode
-│       └── tools.py            # coordinate transforms, cumsum trick, nuScenes utils
+│   ├── backbones/
+│   │   ├── lss_model.py        # LiftSplatShoot, CamEncode, BevEncode
+│   │   └── tools.py            # coordinate transforms, cumsum trick
+│   ├── lidar/
+│   │   ├── pillarize.py        # point cloud → pillar tensor
+│   │   ├── simple_pointnet.py  # shared MLP encoder per pillar
+│   │   ├── backbone.py         # 2D conv backbone (multi-scale down + up)
+│   │   ├── detection_head.py   # SSD-style cls + reg heads
+│   │   └── point_pillars.py    # full LiDAR branch orchestrator
+│   ├── fusion/
+│   │   ├── bev_encoder.py      # concatenate + conv neck
+│   │   └── bev_pipeline.py     # top-level: camera + LiDAR → fused BEV → heads
+│   └── util.py                 # IoU and shared utilities
 ├── scripts/
-│   ├── run_lss.py              # run LSS on nuScenes mini, visualize BEV output
-│   ├── camera_to_bev.py        # project camera images into BEV
-│   └── read_nuscenes.py        # explore nuScenes scene/sample structure
-├── data/                       # nuScenes dataset (gitignored)
-├── images/                     # saved visualizations
-└── papers/                     # reference papers
-```
-
-Planned additions (Phases 3–5):
-
-```
-├── models/
-│   ├── camera/                 # Swin-T backbone + BEV pooling
-│   ├── lidar/                  # PointPillars encoder
-│   └── fusion/                 # fusion neck + detection head
-├── experiments/
-│   ├── camera_only/
-│   ├── lidar_only/
-│   └── fused/                  # ablation configs — camera-only → LiDAR-only → fused
-├── tracking/                   # Kalman filter tracker
-├── inference/                  # C++ TensorRT engine
-└── eval/                       # mAP/NDS metrics
+│   ├── read_nuscenes.py        # explore nuScenes scene/sample structure
+│   ├── run_lss.py              # camera branch: visualize LSS BEV output
+│   ├── run_point_pillars.py    # LiDAR branch: visualize PointPillars BEV output
+│   └── run_bevfusion.py        # full pipeline: visualize fused BEV output
+└── images/                     # saved visualizations
 ```
 
 ## Setup
