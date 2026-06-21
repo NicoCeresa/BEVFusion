@@ -46,9 +46,10 @@ BEVFusion/
 │   └── util.py                 # IoU and shared utilities
 ├── scripts/
 │   ├── read_nuscenes.py        # explore nuScenes scene/sample structure
-│   ├── run_lss.py              # camera branch: visualize LSS BEV output
-│   ├── run_point_pillars.py    # LiDAR branch: visualize PointPillars BEV output
-│   └── run_bevfusion.py        # full pipeline: visualize fused BEV output
+│   ├── visualize.py            # generate all pipeline output images
+│   ├── dataloader.py           # nuScenes dataset + collate_fn
+│   ├── train.py                # training loop with anchor matching + focal loss
+│   └── test.py                 # inference, NMS, height-colored BEV GIF
 └── images/                     # saved visualizations
 ```
 
@@ -61,7 +62,7 @@ pip install torch torchvision nuscenes-devkit open3d einops timm efficientnet_py
 Download the nuScenes dataset (registration required at [nuscenes.org](https://www.nuscenes.org/)). The mini split is sufficient for development.
 
 ```bash
-python scripts/run_lss.py        # run LSS and visualize BEV output
+python scripts/visualize.py      # generate all pipeline output images
 python scripts/read_nuscenes.py  # explore dataset structure
 ```
 
@@ -79,9 +80,11 @@ All outputs below are from an **untrained model** on a single nuScenes mini samp
 
 ### Sensor Inputs
 
-6 synchronized camera views from the nuScenes mini dataset used as input to the camera branch.
+6 synchronized camera views (camera branch input) and a height-colored BEV projection of the raw LiDAR point cloud (LiDAR branch input), both from the same nuScenes mini sample.
 
 ![Camera Inputs](images/camera_inputs.png)
+
+![LiDAR Input](images/lidar_input.png)
 
 ### Camera BEV (LSS)
 

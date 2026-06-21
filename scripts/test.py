@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
-from train import EPOCHS
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -15,6 +14,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from fusion.bev_pipeline import BEVFusion
 from dataloader import NuScenesDataset
+from train import EPOCHS, NUM_ANCHORS, generate_anchors
+from visualize import lidar_height_rgb
 
 with open(ROOT / "config.yaml") as f:
     cfg = yaml.safe_load(f)
@@ -27,48 +28,16 @@ GRID_CONF = {
 }
 DATA_AUG_CONF = {'final_dim': (128, 352)}
 
-BEV_H, BEV_W  = 200, 200
-X_MIN, X_MAX   = -50.0, 50.0
-Y_MIN, Y_MAX   = -50.0, 50.0
-NUM_CLASSES    = 3
-ANCHORS = [
-    (0, 4.73, 2.08, 1.77, 0.0),
-    (0, 4.73, 2.08, 1.77, 1.5708),
-    (1, 0.76, 0.76, 1.73, 0.0),
-    (2, 1.76, 0.60, 1.73, 0.0),
-    (2, 1.76, 0.60, 1.73, 1.5708),
-]
-NUM_ANCHORS    = len(ANCHORS)
-ANCHOR_Z       = -1.0
+BEV_H, BEV_W = 200, 200
+X_MIN, X_MAX  = -50.0, 50.0
+Y_MIN, Y_MAX  = -50.0, 50.0
+NUM_CLASSES   = 3
 
 SCORE_THRESH   = 0.3
 NMS_IOU_THRESH = 0.3
 CLASS_NAMES    = ['car', 'pedestrian', 'bicycle']
 CLASS_COLORS   = ['#4488ff', '#44ff88', '#ff4444']
 NUM_SAMPLES    = 10
-
-
-# ---------------------------------------------------------------------------
-# Anchors  (mirrors train.py)
-# ---------------------------------------------------------------------------
-
-def generate_anchors(device):
-    xs = torch.linspace(X_MIN, X_MAX, BEV_W + 1)[:-1] + (X_MAX - X_MIN) / BEV_W / 2
-    ys = torch.linspace(Y_MIN, Y_MAX, BEV_H + 1)[:-1] + (Y_MAX - Y_MIN) / BEV_H / 2
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-
-    per_anchor = []
-    for _, w, l, h, rot in ANCHORS:
-        per_anchor.append(torch.stack([
-            grid_x, grid_y,
-            torch.full_like(grid_x, ANCHOR_Z),
-            torch.full_like(grid_x, w),
-            torch.full_like(grid_x, l),
-            torch.full_like(grid_x, h),
-            torch.full_like(grid_x, rot),
-        ], dim=-1))
-
-    return torch.stack(per_anchor, dim=2).view(-1, 7).to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -156,34 +125,6 @@ def box_corners(box):
     corners = np.array([[-w/2, -l/2], [w/2, -l/2], [w/2, l/2], [-w/2, l/2]])
     rot = np.array([[c, -s], [s, c]])
     return corners @ rot.T + np.array([x, y])
-
-
-Z_MIN, Z_MAX = -3.0, 5.0   # height range for colormap
-
-
-def lidar_height_rgb(points):
-    """
-    Returns (H, W, 3) uint8 RGB image where color encodes LiDAR point height (z).
-    Empty cells are black. Uses plasma colormap.
-    """
-    pts = points.numpy()
-    mask = (pts[:, 0] >= X_MIN) & (pts[:, 0] < X_MAX) & \
-           (pts[:, 1] >= Y_MIN) & (pts[:, 1] < Y_MAX)
-    pts = pts[mask]
-
-    xi = ((pts[:, 0] - X_MIN) / (X_MAX - X_MIN) * BEV_W).astype(int).clip(0, BEV_W - 1)
-    yi = ((pts[:, 1] - Y_MIN) / (Y_MAX - Y_MIN) * BEV_H).astype(int).clip(0, BEV_H - 1)
-
-    order = np.argsort(pts[:, 2])
-    height_map = np.zeros((BEV_H, BEV_W))
-    occupied    = np.zeros((BEV_H, BEV_W), dtype=bool)
-    height_map[yi[order], xi[order]] = pts[order, 2]
-    occupied[yi, xi] = True
-
-    height_norm = np.clip((height_map - Z_MIN) / (Z_MAX - Z_MIN), 0, 1)
-    rgb = (plt.cm.plasma(height_norm)[:, :, :3] * 255).astype(np.uint8)
-    rgb[~occupied] = 0
-    return rgb
 
 
 def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels, sample_idx):
