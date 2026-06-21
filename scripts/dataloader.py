@@ -88,6 +88,13 @@ class NuScenesDataset(Dataset):
 
     def _load_annotations(self, sample):
         (x_min, x_max), (y_min, y_max), _ = POINT_CLOUD_RANGE
+
+        # nuScenes annotations are in global frame — transform to ego frame
+        lidar_data  = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        ego_pose    = self.nusc.get('ego_pose', lidar_data['ego_pose_token'])
+        ego_t       = np.array(ego_pose['translation'])
+        ego_r       = Quaternion(ego_pose['rotation'])
+
         boxes, labels = [], []
 
         for ann_token in sample['anns']:
@@ -97,12 +104,14 @@ class NuScenesDataset(Dataset):
             if category not in CLASS_MAP:
                 continue
 
-            x, y, z = ann['translation']
+            # global → ego frame
+            xyz = ego_r.inverse.rotate(np.array(ann['translation']) - ego_t)
+            x, y, z = xyz
             if not (x_min <= x <= x_max and y_min <= y <= y_max):
                 continue
 
             w, l, h = ann['size']
-            yaw = Quaternion(ann['rotation']).yaw_pitch_roll[0]
+            yaw = (ego_r.inverse * Quaternion(ann['rotation'])).yaw_pitch_roll[0]
 
             boxes.append([x, y, z, w, l, h, yaw])
             labels.append(CLASS_MAP[category])

@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
+from train import EPOCHS
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -29,10 +30,15 @@ DATA_AUG_CONF = {'final_dim': (128, 352)}
 BEV_H, BEV_W  = 200, 200
 X_MIN, X_MAX   = -50.0, 50.0
 Y_MIN, Y_MAX   = -50.0, 50.0
-NUM_ANCHORS    = 2
 NUM_CLASSES    = 3
-ANCHOR_SIZE    = (4.73, 2.08, 1.77)
-ANCHOR_ROTATIONS = [0.0, 1.5708]
+ANCHORS = [
+    (0, 4.73, 2.08, 1.77, 0.0),
+    (0, 4.73, 2.08, 1.77, 1.5708),
+    (1, 0.76, 0.76, 1.73, 0.0),
+    (2, 1.76, 0.60, 1.73, 0.0),
+    (2, 1.76, 0.60, 1.73, 1.5708),
+]
+NUM_ANCHORS    = len(ANCHORS)
 ANCHOR_Z       = -1.0
 
 SCORE_THRESH   = 0.3
@@ -51,10 +57,9 @@ def generate_anchors(device):
     ys = torch.linspace(Y_MIN, Y_MAX, BEV_H + 1)[:-1] + (Y_MAX - Y_MIN) / BEV_H / 2
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
 
-    w, l, h = ANCHOR_SIZE
-    per_rotation = []
-    for rot in ANCHOR_ROTATIONS:
-        per_rotation.append(torch.stack([
+    per_anchor = []
+    for _, w, l, h, rot in ANCHORS:
+        per_anchor.append(torch.stack([
             grid_x, grid_y,
             torch.full_like(grid_x, ANCHOR_Z),
             torch.full_like(grid_x, w),
@@ -63,7 +68,7 @@ def generate_anchors(device):
             torch.full_like(grid_x, rot),
         ], dim=-1))
 
-    return torch.stack(per_rotation, dim=2).view(-1, 7).to(device)
+    return torch.stack(per_anchor, dim=2).view(-1, 7).to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +228,7 @@ def test():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     ckpt_dir = ROOT / "checkpoints"
-    ckpts = sorted(ckpt_dir.glob("*.pt"))
+    ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
     if not ckpts:
         raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
     ckpt_path = ckpts[-1]
@@ -233,6 +238,7 @@ def test():
         lss_weights   = cfg['weights']['lss'],
         grid_conf     = GRID_CONF,
         data_aug_conf = DATA_AUG_CONF,
+        num_anchors   = NUM_ANCHORS,
     ).to(device)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
@@ -282,7 +288,7 @@ def test():
         ))
 
 
-    gif_path = images_dir / "test_results.gif"
+    gif_path = images_dir / f"test_results_{EPOCHS}_epochs.gif"
     frames[0].save(
         gif_path,
         save_all=True,

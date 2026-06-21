@@ -28,13 +28,21 @@ DATA_AUG_CONF = {'final_dim': (128, 352)}
 BEV_H, BEV_W = 200, 200
 X_MIN, X_MAX  = -50.0, 50.0
 Y_MIN, Y_MAX  = -50.0, 50.0
-NUM_ANCHORS   = 2
 NUM_CLASSES   = 3
+EPOCHS = 2
 
-# Two rotation anchors at car scale — regression head refines from here
-ANCHOR_SIZE      = (4.73, 2.08, 1.77)   # w, l, h in metres
-ANCHOR_ROTATIONS = [0.0, 1.5708]         # 0° and 90°
-ANCHOR_Z         = -1.0                  # typical ground-plane object height in ego frame
+# Per-class anchors: (class_idx, w, l, h, rotation_rad)
+# Each class gets anchors sized to match its typical object dimensions.
+ANCHORS = [
+    (0, 4.73, 2.08, 1.77, 0.0),     # car, 0°
+    (0, 4.73, 2.08, 1.77, 1.5708),  # car, 90°
+    (1, 0.76, 0.76, 1.73, 0.0),     # pedestrian (symmetric — 1 rotation)
+    (2, 1.76, 0.60, 1.73, 0.0),     # bicycle, 0°
+    (2, 1.76, 0.60, 1.73, 1.5708),  # bicycle, 90°
+]
+NUM_ANCHORS    = len(ANCHORS)        # 5
+ANCHOR_CLASSES = [a[0] for a in ANCHORS]   # [0, 0, 1, 2, 2]
+ANCHOR_Z       = -1.0
 
 POS_IOU_THRESH = 0.50
 NEG_IOU_THRESH = 0.35
@@ -45,18 +53,14 @@ NEG_IOU_THRESH = 0.35
 # ---------------------------------------------------------------------------
 
 def generate_anchors(device: torch.device) -> torch.Tensor:
-    """
-    Returns (BEV_H * BEV_W * NUM_ANCHORS, 7) anchor boxes.
-    Ordered so that .view(BEV_H, BEV_W, NUM_ANCHORS, 7) is spatially consistent.
-    """
+    """Returns (BEV_H * BEV_W * NUM_ANCHORS, 7). Ordered (H, W, A) so .view works."""
     xs = torch.linspace(X_MIN, X_MAX, BEV_W + 1)[:-1] + (X_MAX - X_MIN) / BEV_W / 2
     ys = torch.linspace(Y_MIN, Y_MAX, BEV_H + 1)[:-1] + (Y_MAX - Y_MIN) / BEV_H / 2
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # (H, W)
 
-    w, l, h = ANCHOR_SIZE
-    per_rotation = []
-    for rot in ANCHOR_ROTATIONS:
-        per_rotation.append(torch.stack([
+    per_anchor = []
+    for _, w, l, h, rot in ANCHORS:
+        per_anchor.append(torch.stack([
             grid_x,
             grid_y,
             torch.full_like(grid_x, ANCHOR_Z),
@@ -64,11 +68,9 @@ def generate_anchors(device: torch.device) -> torch.Tensor:
             torch.full_like(grid_x, l),
             torch.full_like(grid_x, h),
             torch.full_like(grid_x, rot),
-        ], dim=-1))                                 # (H, W, 7)
+        ], dim=-1))  # (H, W, 7)
 
-    # stack along anchor axis → (H, W, A, 7) → (H*W*A, 7)
-    anchors = torch.stack(per_rotation, dim=2).view(-1, 7)
-    return anchors.to(device)
+    return torch.stack(per_anchor, dim=2).view(-1, 7).to(device)  # (H*W*A, 7)
 
 
 # ---------------------------------------------------------------------------
@@ -127,16 +129,26 @@ def build_targets(anchors, gt_boxes, gt_labels, device):
     pos_mask    = torch.zeros(N, dtype=torch.bool, device=device)
     neg_mask    = torch.ones(N, dtype=torch.bool, device=device)
 
+    # (N,) — which class each anchor slot belongs to
+    anchor_classes = torch.tensor(ANCHOR_CLASSES * (BEV_H * BEV_W), device=device)
+
     for box, label in zip(gt_boxes, gt_labels):
         box = box.to(device)
-        ious = iou_bev(anchors, box)
+        cls_label = label.item()
+
+        # Only compute IoU against anchors of the matching class
+        class_mask = anchor_classes == cls_label
+        ious = torch.zeros(N, device=device)
+        ious[class_mask] = iou_bev(anchors[class_mask], box)
 
         pos = ious >= POS_IOU_THRESH
-        pos[ious.argmax()] = True           # always assign the best anchor
+        # Force-assign the best same-class anchor even if below threshold
+        best = class_mask.nonzero(as_tuple=True)[0][ious[class_mask].argmax()]
+        pos[best] = True
 
-        neg_mask[ious >= NEG_IOU_THRESH] = False   # ignore anchors in [neg, pos)
+        neg_mask[ious >= NEG_IOU_THRESH] = False
 
-        cls_targets[pos, label.item()] = 1.0
+        cls_targets[pos, cls_label] = 1.0
         reg_targets[pos] = encode_reg(anchors[pos], box)
         pos_mask[pos] = True
         neg_mask[pos] = False
@@ -216,6 +228,7 @@ def train():
         lss_weights   = cfg['weights']['lss'],
         grid_conf     = GRID_CONF,
         data_aug_conf = DATA_AUG_CONF,
+        num_anchors   = NUM_ANCHORS,
     ).to(device)
 
     anchors   = generate_anchors(device)
@@ -225,7 +238,7 @@ def train():
     ckpt_dir = ROOT / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
 
-    EPOCHS = 1
+    
 
     for epoch in tqdm(range(EPOCHS), desc="Epochs"):
         model.train()

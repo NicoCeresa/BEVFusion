@@ -105,7 +105,7 @@ Camera and LiDAR BEV features concatenated and refined by the convolutional BEV 
 
 10-sample inference loop after training. Background is colored by LiDAR point height (purple = ground, yellow = rooftop). Solid colored boxes are model predictions (blue = car, green = pedestrian, red = bicycle); dashed white boxes are ground truth annotations.
 
-![Detection Results](images/test_results.gif)
+![Detection Results](images/test_results_2_epochs.gif)
 
 ## Lift, Splat, Shoot (LSS)
 
