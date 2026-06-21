@@ -12,9 +12,9 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from backbones.lss_model import compile_model
+from camera.lss import compile_model
 from lidar.point_pillars import PointPillars
-from fusion.bev_pipeline import BEVFusion
+from fusion.pipeline import BEVFusion
 from dataloader import NuScenesDataset, CAMERAS
 
 with open(ROOT / "config.yaml") as f:

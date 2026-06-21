@@ -4,10 +4,10 @@
 import torch
 import torch.nn as nn
 
-from backbones.lss_model import compile_model
+from camera.lss import compile_model
 from lidar.point_pillars import PointPillars
 from fusion.bev_encoder import BEVEncoder
-from lidar.detection_head import SSD
+from fusion.detection_head import SSD
 
 
 class BEVFusion(nn.Module):

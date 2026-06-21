@@ -11,7 +11,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.bev_pipeline import BEVFusion
+from fusion.pipeline import BEVFusion
 from dataloader import NuScenesDataset, collate_fn
 
 with open(ROOT / "config.yaml") as f:

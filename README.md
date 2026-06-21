@@ -4,7 +4,7 @@ Implementation of camera–LiDAR fusion for 3D object detection in PyTorch, with
 
 ## What it does
 
-Takes synchronized camera images (6×) and a LiDAR point cloud as input and outputs 3D bounding boxes with class labels, velocities, and headings.
+Takes synchronized camera images (6×) and a LiDAR point cloud as input and outputs 3D bounding boxes with class labels and headings.
 
 ```
 Camera frames (6x)  ──► EfficientNet + LSS BEV Pooling ──┐
@@ -31,18 +31,18 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 BEVFusion/
 ├── config.yaml
 ├── src/
-│   ├── backbones/
-│   │   ├── lss_model.py        # LiftSplatShoot, CamEncode, BevEncode
+│   ├── camera/
+│   │   ├── lss.py              # LiftSplatShoot, CamEncode, BevEncode
 │   │   └── tools.py            # coordinate transforms, cumsum trick
 │   ├── lidar/
 │   │   ├── pillarize.py        # point cloud → pillar tensor
-│   │   ├── simple_pointnet.py  # shared MLP encoder per pillar
+│   │   ├── pointnet.py         # shared MLP encoder per pillar
 │   │   ├── backbone.py         # 2D conv backbone (multi-scale down + up)
-│   │   ├── detection_head.py   # SSD-style cls + reg heads
 │   │   └── point_pillars.py    # full LiDAR branch orchestrator
 │   ├── fusion/
 │   │   ├── bev_encoder.py      # concatenate + conv neck
-│   │   └── bev_pipeline.py     # top-level: camera + LiDAR → fused BEV → heads
+│   │   ├── detection_head.py   # SSD-style cls + reg heads
+│   │   └── pipeline.py         # top-level: camera + LiDAR → fused BEV → heads
 │   └── util.py                 # IoU and shared utilities
 ├── scripts/
 │   ├── read_nuscenes.py        # explore nuScenes scene/sample structure
@@ -184,7 +184,7 @@ LSS merges `reduction_5` (what a pixel means — semantic richness, broad contex
 
 ## Key papers
 
-- [BEVFusion](https://arxiv.org/abs/2205.13542) — Liang et al., 2022 (primary architecture reference)
+- [BEVFusion](https://arxiv.org/abs/2205.13542) — Liu et al., 2022 (primary architecture reference)
 - [Lift, Splat, Shoot](https://arxiv.org/abs/2008.05711) — Philion & Fidler, 2020 (camera-to-BEV projection)
 - [EfficientNet](https://arxiv.org/abs/1905.11946) — Tan & Le, 2019 (camera feature backbone)
 - [PointPillars](https://arxiv.org/abs/1812.05784) — Lang et al., 2019 (LiDAR encoder, Phase 3)

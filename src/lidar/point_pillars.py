@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from .pillarize import discretize_point_cloud, get_pillar_centers, augment_pillars, optimize_pillars
-from .simple_pointnet import SimplifiedPointNet
+from .pointnet import SimplifiedPointNet
 from .backbone import PillarBackbone
 
 class PointPillars(nn.Module):
