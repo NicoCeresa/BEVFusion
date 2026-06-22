@@ -25,6 +25,12 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 | 5 | Data loader + loss function + training | ✅ Done |
 | 6 | C++ TensorRT inference engine | 🔲 Planned |
 
+### Next Steps:
+- TensorRT + C++ inference engine (you're already planning this — prioritize INT8 quantization with accuracy benchmarking)
+- ByteTrack or SORT tracker on top of the detection head output
+- Temporal BEV fusion — even just stacking 2-3 past BEV frames as input channels is a meaningful step, and you can cite BEVFormer as motivation
+- Actual trained mAP numbers — even 2-epoch partial results on nuScenes mini with a table comparing camera-only vs fused
+
 ## Project structure
 
 ```
