@@ -192,9 +192,14 @@ def test():
     images_dir = ROOT / "images"
     images_dir.mkdir(exist_ok=True)
 
+    # Find the first sample that has GT boxes, then run NUM_SAMPLES consecutive
+    # frames from there so the ego vehicle moves through the scene sequentially.
+    start = next(i for i in range(len(dataset)) if len(dataset[i]['gt_boxes']) > 0)
+    indices = range(start, min(start + NUM_SAMPLES, len(dataset)))
+
     frames = []
 
-    for idx in range(min(NUM_SAMPLES, len(dataset))):
+    for idx in indices:
         sample = dataset[idx]
 
         images     = sample['images'].unsqueeze(0).to(device)
@@ -217,7 +222,7 @@ def test():
             scores = scores[kept]
             labels = labels[kept]
 
-        print(f"Sample {idx}: {len(boxes)} detections")
+        print(f"Sample {idx}: {len(boxes)} detections, {len(sample['gt_boxes'])} GT boxes, max score {scores.max().item() if len(scores) else 0.0:.3f}")
         frames.append(render_frame(
             lidar_pts   = sample['lidar_points'].cpu(),
             pred_boxes  = boxes.cpu(),
