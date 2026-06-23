@@ -3,6 +3,7 @@ notes/
 .bevfusion_env/
 config*.yaml
 CLAUDE.md
+pyright*
 
 # Dataset — nuScenes is too large for git
 data/

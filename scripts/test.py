@@ -1,9 +1,10 @@
-import io
 import sys
 import yaml
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from pathlib import Path
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
@@ -132,20 +133,20 @@ def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, gt_boxes, gt_l
     fig, ax = plt.subplots(figsize=(8, 8))
 
     ax.imshow(lidar_height_rgb(lidar_pts), origin='lower',
-              extent=[X_MIN, X_MAX, Y_MIN, Y_MAX])
+              extent=(X_MIN, X_MAX, Y_MIN, Y_MAX))
     ax.set_xlim(X_MIN, X_MAX)
     ax.set_ylim(Y_MIN, Y_MAX)
     ax.set_aspect('equal')
 
     for box, label in zip(gt_boxes.numpy(), gt_labels.numpy()):
         corners = box_corners(box)
-        ax.add_patch(plt.Polygon(corners, fill=False, edgecolor='white',
-                                 linestyle='--', linewidth=1.5))
+        ax.add_patch(Polygon(corners, fill=False, edgecolor='white',
+                             linestyle='--', linewidth=1.5))
 
     for box, score, label in zip(pred_boxes.numpy(), pred_scores.numpy(), pred_labels.numpy()):
         corners = box_corners(box)
         color   = CLASS_COLORS[int(label)]
-        ax.add_patch(plt.Polygon(corners, fill=False, edgecolor=color, linewidth=2.0))
+        ax.add_patch(Polygon(corners, fill=False, edgecolor=color, linewidth=2.0))
         ax.text(box[0], box[1], f"{CLASS_NAMES[int(label)]} {score:.2f}",
                 color=color, fontsize=6, ha='center', va='center')
 
@@ -156,14 +157,15 @@ def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, gt_boxes, gt_l
 
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')
-    ax.set_title(f'BEVFusion — sample {sample_idx} | pred (solid) vs GT (dashed)')
+    ax.set_title(f'BEVFusion: sample {sample_idx} | pred (solid) vs GT (dashed)')
     plt.tight_layout()
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    img = Image.frombuffer('RGBA', canvas.get_width_height(),
+                           bytes(canvas.buffer_rgba())).convert('RGB')
     plt.close()
-    buf.seek(0)
-    return Image.open(buf).copy()
+    return img
 
 def test():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
