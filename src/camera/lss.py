@@ -146,7 +146,7 @@ class CamEncode(nn.Module):
 
         # Blocks
         for idx, block in enumerate(self.trunk._blocks):
-            drop_connect_rate = self.trunk._global_params.drop_connect_rate
+            drop_connect_rate = self.trunk._global_params.drop_connect_rate if self.trunk._global_params is not None else 0.0
             if drop_connect_rate:
                 drop_connect_rate *= float(idx) / len(self.trunk._blocks) # scale drop connect_rate
             x = block(x, drop_connect_rate=drop_connect_rate)
@@ -398,24 +398,20 @@ class LiftSplatShoot(nn.Module):
         B, N, D, H, W, C = x.shape
         Nprime = B*N*D*H*W
 
-        # flatten x
         x = x.reshape(Nprime, C)
 
-        # flatten indices
         geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
         batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
                              device=x.device, dtype=torch.long) for ix in range(B)])
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
 
-        # filter out points that are outside box
         kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0])\
             & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1])\
             & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
         x = x[kept]
         geom_feats = geom_feats[kept]
 
-        # get tensors from the same voxel next to each other
         ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)\
             + geom_feats[:, 1] * (self.nx[2] * B)\
             + geom_feats[:, 2] * B\
@@ -423,17 +419,14 @@ class LiftSplatShoot(nn.Module):
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
-        # cumsum trick
         if not self.use_quickcumsum:
             x, geom_feats = cumsum_trick(x, geom_feats, ranks)
         else:
             x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
 
-        # griddify (B x C x Z x X x Y)
-        final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
+        final = torch.zeros((B, C, int(self.nx[2]), int(self.nx[0]), int(self.nx[1])), device=x.device)
         final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]] = x
 
-        # collapse Z
         final = torch.cat(final.unbind(dim=2), 1)
 
         return final
