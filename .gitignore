@@ -4,6 +4,7 @@ notes/
 config*.yaml
 CLAUDE.md
 pyright*
+.vscode/*
 
 # Dataset — nuScenes is too large for git
 data/
@@ -17,7 +18,7 @@ checkpoints/
 *.trt
 
 # C++ build output
-inference/build/
+src/cpp/build/
 
 # Experiment outputs
 experiments/*/logs/

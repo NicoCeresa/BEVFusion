@@ -24,3 +24,6 @@ def iou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
     union = box1_area + box2_area - intersection
 
     return intersection / union
+if __name__ == "__main__":
+    import torch
+    print(torch.version.cuda)
