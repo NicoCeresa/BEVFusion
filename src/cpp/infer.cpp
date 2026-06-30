@@ -1,7 +1,8 @@
 #include "NvInfer.h"
 #include "NvOnnxParser.h"
+#include "lidar_pipeline.h"
+#include "camera_pipeline.h"
 #include <cuda_runtime.h>
-#include <stdio.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -116,12 +117,20 @@ int main() {
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
-    Dims4 cam_dims{6, 3, 128, 352};
-    std::vector<float> cam_input(6 * 3 * 128 * 352);  // TODO: fill from image data
+    // camera branch
+    std::vector<std::string> image_paths = {
+        "data/CAM_FRONT.jpg", "data/CAM_FRONT_LEFT.jpg", "data/CAM_FRONT_RIGHT.jpg",
+        "data/CAM_BACK.jpg",  "data/CAM_BACK_LEFT.jpg",  "data/CAM_BACK_RIGHT.jpg"
+    };
+    std::vector<float> cam_input = load_and_preprocess_images(image_paths);
+    Dims4 cam_dims{6, 3, IMG_H, IMG_W};
     std::vector<float> cam_output = infer(cam_encode, stream, cam_input, cam_dims);
 
+    // lidar branch
+    voxel_size vs{0.2f, 0.2f, 0.4f};
+    point_cloud_range range{-50.f, 50.f, -50.f, 50.f, -3.f, 5.f};
+    std::vector<float> pillar_input = run_lidar_pipeline("data/LIDAR_TOP.bin", vs, range, 32);
     Dims3 pointnet_dims{10000, 32, 9};
-    std::vector<float> pillar_input(10000 * 32 * 9);  // TODO: fill from pillarize pipeline
     std::vector<float> pointnet_output = infer(pointnet, stream, pillar_input, pointnet_dims);
 
     cudaStreamDestroy(stream);
