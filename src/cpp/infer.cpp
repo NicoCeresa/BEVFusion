@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <iostream>
 #include <fstream>
+#include <vector>
 
 using namespace nvinfer1;
 using namespace nvonnxparser;
@@ -23,7 +24,7 @@ void save_engine(IHostMemory* serializedModel, const char* outputFile) {
                serializedModel->size());
 }
 
-IBuilder * build_engine(const char* modelFile) {
+void build_engine(const char* modelFile) {
     IBuilder* builder = createInferBuilder(logger);
     INetworkDefinition* network = builder->createNetworkV2(0);
     IParser* parser = createParser(*network, logger);
@@ -49,4 +50,24 @@ IBuilder * build_engine(const char* modelFile) {
     
     save_engine(serializedModel, "cam_encode.engine");
     delete serializedModel;
+}
+
+ICudaEngine* load_engine(const char* engineFile, IRuntime* runtime) {
+    std::ifstream file(engineFile, std::ios::binary | std::ios::ate);
+    size_t size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<char> buffer(size);
+    file.read(buffer.data(), size);
+
+    return runtime->deserializeCudaEngine(buffer.data(), size);
+}
+
+
+int main() {
+    IRuntime* runtime = createInferRuntime(logger);
+    
+    ICudaEngine* cam_encode = load_engine("engines/cam_encode.engine", runtime);
+    ICudaEngine* pointnet   = load_engine("engines/pointnet.engine", runtime);
+
 }
