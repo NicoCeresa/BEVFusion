@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 #include <vector>
 
 using namespace nvinfer1;
@@ -25,7 +26,7 @@ void save_engine(IHostMemory* serializedModel, const char* outputFile) {
                serializedModel->size());
 }
 
-void build_engine(const char* modelFile) {
+void build_engine(const char* modelFile, const char* outputFile) {
     IBuilder* builder = createInferBuilder(logger);
     INetworkDefinition* network = builder->createNetworkV2(0);
     IParser* parser = createParser(*network, logger);
@@ -49,8 +50,14 @@ void build_engine(const char* modelFile) {
     delete config;
     delete builder;
     
-    save_engine(serializedModel, "cam_encode.engine");
+    save_engine(serializedModel, outputFile);
     delete serializedModel;
+}
+
+void ensure_engine(const char* modelFile, const char* engineFile) {
+    if (!std::filesystem::exists(engineFile)) {
+        build_engine(modelFile, engineFile);
+    }
 }
 
 ICudaEngine* load_engine(const char* engineFile, IRuntime* runtime) {
@@ -110,7 +117,14 @@ std::vector<float> infer(ICudaEngine* engine, cudaStream_t stream, std::vector<f
 
 int main() {
     IRuntime* runtime = createInferRuntime(logger);
-    
+
+    ensure_engine("engines/cam_encode.onnx", "engines/cam_encode.engine");
+    ensure_engine("engines/bev_encode.onnx", "engines/bev_encode.engine");
+    ensure_engine("engines/pointnet.onnx", "engines/pointnet.engine");
+    ensure_engine("engines/pillar_backbone.onnx", "engines/pillar_backbone.engine");
+    ensure_engine("engines/bev_encoder.onnx", "engines/bev_encoder.engine");
+    ensure_engine("engines/ssd.onnx", "engines/ssd.engine");
+
     ICudaEngine* cam_encode      = load_engine("engines/cam_encode.engine", runtime);
     ICudaEngine* bev_encode      = load_engine("engines/bev_encode.engine", runtime);
     ICudaEngine* pointnet        = load_engine("engines/pointnet.engine", runtime);
