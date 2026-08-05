@@ -7,10 +7,11 @@ add_executable(infer infer.cpp pillarize.cpp lidar_pipeline.cpp camera_pipeline.
 
 target_include_directories(infer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    /media/nico/Games/TensorRT-11.0.0.114/include
+    /mnt/BC42E05D42E01E40/TensorRT-11.0.0.114/include
 )
 
 target_link_libraries(infer PRIVATE
-    /media/nico/Games/TensorRT-11.0.0.114/lib/libnvinfer.so
-    /media/nico/Games/TensorRT-11.0.0.114/lib/libnvonnxparser.so
+    /mnt/BC42E05D42E01E40/TensorRT-11.0.0.114/lib/libnvinfer.so
+    /mnt/BC42E05D42E01E40/TensorRT-11.0.0.114/lib/libnvonnxparser.so
+    /usr/lib/x86_64-linux-gnu/libcudart.so
 )

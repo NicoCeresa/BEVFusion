@@ -111,8 +111,12 @@ std::vector<float> infer(ICudaEngine* engine, cudaStream_t stream, std::vector<f
 int main() {
     IRuntime* runtime = createInferRuntime(logger);
     
-    ICudaEngine* cam_encode = load_engine("engines/cam_encode.engine", runtime);
-    ICudaEngine* pointnet   = load_engine("engines/pointnet.engine", runtime);
+    ICudaEngine* cam_encode      = load_engine("engines/cam_encode.engine", runtime);
+    ICudaEngine* bev_encode      = load_engine("engines/bev_encode.engine", runtime);
+    ICudaEngine* pointnet        = load_engine("engines/pointnet.engine", runtime);
+    ICudaEngine* pillar_backbone = load_engine("engines/pillar_backbone.engine", runtime);
+    ICudaEngine* bev_encoder     = load_engine("engines/bev_encoder.engine", runtime);
+    ICudaEngine* ssd             = load_engine("engines/ssd.engine", runtime);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
