@@ -5,12 +5,19 @@ from PIL import Image
 from pyquaternion import Quaternion
 from torch.utils.data import Dataset
 from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.data_classes import LidarPointCloud
 
 CAMERAS = [
     'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT',
     'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT',
 ]
 IMG_SIZE = (128, 352)  # H, W — must match LSS pretrained grid
+
+# LIDAR_TOP spins at ~20Hz but nuScenes only annotates the 2Hz keyframes, so a
+# single keyframe scan is sparse. Aggregating the preceding sweeps (motion-
+# compensated into the keyframe's ego frame) densifies the point cloud — the
+# same convention used by CenterPoint/BEVFusion's own nuScenes configs.
+NUM_SWEEPS = 10
 
 CLASS_MAP = {
     'vehicle.car':                  0,
@@ -24,15 +31,41 @@ CLASS_MAP = {
 POINT_CLOUD_RANGE = ((-50.0, 50.0), (-50.0, 50.0), (-5.0, 3.0))
 
 
+def _scene_is_available(nusc, scene):
+    sample = nusc.get('sample', scene['first_sample_token'])
+    lidar_sd = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    return (Path(nusc.dataroot) / lidar_sd['filename']).exists()
+
+
+def available_scene_names(nusc):
+    """Scene names whose sensor files are actually present on disk — a local
+    copy may only have a subset (e.g. a single trainval blob part)."""
+    return {scene['name'] for scene in nusc.scene if _scene_is_available(nusc, scene)}
+
+
 class NuScenesDataset(Dataset):
-    def __init__(self, nusc: NuScenes):
+    def __init__(self, nusc: NuScenes, scene_names: set = None):
         self.nusc = nusc
+        # sample_indices maps dataset-local index -> index into nusc.sample.
+        # Restricting to scene_names (e.g. nuScenes' own train/val scene split)
+        # keeps a scene's samples entirely on one side — a random *sample*-level
+        # split would leak correlated frames from the same drive across both.
+        # Defaults to every scene actually present on disk if scene_names is None.
+        # Callers that need to cross-reference back to nuScenes (e.g. eval.py
+        # building a submission) must go through this mapping, not use the
+        # dataset index directly as a nusc.sample index.
+        if scene_names is None:
+            scene_names = available_scene_names(nusc)
+        scene_tokens = {s['token'] for s in nusc.scene if s['name'] in scene_names}
+        self.sample_indices = [
+            i for i, s in enumerate(nusc.sample) if s['scene_token'] in scene_tokens
+        ]
 
     def __len__(self):
-        return len(self.nusc.sample)
+        return len(self.sample_indices)
 
     def __getitem__(self, idx):
-        sample = self.nusc.sample[idx]
+        sample = self.nusc.sample[self.sample_indices[idx]]
 
         images, rots, trans, intrins, post_rots, post_trans = self._load_cameras(sample)
         lidar_points = self._load_lidar(sample)
@@ -46,7 +79,7 @@ class NuScenesDataset(Dataset):
             'post_rots':    post_rots,     # (N, 3, 3)
             'post_trans':   post_trans,    # (N, 3)
             'lidar_points': lidar_points,  # (P, 4) — variable length per sample
-            'gt_boxes':     gt_boxes,      # (M, 7) — variable length per sample
+            'gt_boxes':     gt_boxes,      # (M, 9) — variable length per sample
             'gt_labels':    gt_labels,     # (M,)
         }
 
@@ -81,10 +114,10 @@ class NuScenesDataset(Dataset):
         )
 
     def _load_lidar(self, sample):
-        lidar_data = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
-        path = Path(self.nusc.dataroot) / lidar_data['filename']
-        points = np.fromfile(path, dtype=np.float32).reshape(-1, 5)
-        return torch.tensor(points[:, :4])  # (P, 4) x,y,z,intensity
+        # Aggregates the keyframe scan with NUM_SWEEPS-1 preceding sweeps, each
+        # motion-compensated into the keyframe's ego frame — see NUM_SWEEPS above.
+        pc, _ = LidarPointCloud.from_file_multisweep(self.nusc, sample, 'LIDAR_TOP', 'LIDAR_TOP', nsweeps=NUM_SWEEPS)
+        return torch.tensor(pc.points.T, dtype=torch.float)  # (P, 4) x,y,z,intensity
 
     def _load_annotations(self, sample):
         (x_min, x_max), (y_min, y_max), _ = POINT_CLOUD_RANGE
@@ -113,15 +146,19 @@ class NuScenesDataset(Dataset):
             w, l, h = ann['size']
             yaw = (ego_r.inverse * Quaternion(ann['rotation'])).yaw_pitch_roll[0]
 
-            boxes.append([x, y, z, w, l, h, yaw])
+            # global → ego frame (rotation only — velocity is a vector, not a position)
+            vel_global = self.nusc.box_velocity(ann_token)
+            vx, vy, _ = ego_r.inverse.rotate(np.nan_to_num(vel_global, nan=0.0))
+
+            boxes.append([x, y, z, w, l, h, yaw, vx, vy])
             labels.append(CLASS_MAP[category])
 
         if boxes:
             return (
-                torch.tensor(boxes, dtype=torch.float),  # (M, 7)
+                torch.tensor(boxes, dtype=torch.float),  # (M, 9)
                 torch.tensor(labels, dtype=torch.long),  # (M,)
             )
-        return torch.zeros(0, 7), torch.zeros(0, dtype=torch.long)
+        return torch.zeros(0, 9), torch.zeros(0, dtype=torch.long)
 
 
 def collate_fn(batch):
@@ -137,6 +174,6 @@ def collate_fn(batch):
         'post_rots':    torch.stack([b['post_rots'] for b in batch]),    # (B, N, 3, 3)
         'post_trans':   torch.stack([b['post_trans'] for b in batch]),   # (B, N, 3)
         'lidar_points': [b['lidar_points'] for b in batch],              # list of (P_i, 4)
-        'gt_boxes':     [b['gt_boxes'] for b in batch],                  # list of (M_i, 7)
+        'gt_boxes':     [b['gt_boxes'] for b in batch],                  # list of (M_i, 9)
         'gt_labels':    [b['gt_labels'] for b in batch],                 # list of (M_i,)
     }

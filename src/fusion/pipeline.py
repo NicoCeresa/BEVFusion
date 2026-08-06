@@ -43,7 +43,7 @@ class BEVFusion(nn.Module):
         points:    (N, 4) — x, y, z, intensity
 
         returns: cls (B, num_anchors * num_classes, H, W)
-                 reg (B, num_anchors * 7, H, W)
+                 reg (B, num_anchors * 9, H, W)
         """
         camera_bev = self.camera_encoder(images, rots, trans, intrins, post_rots, post_trans)
         lidar_bev  = self.lidar_encoder(points)

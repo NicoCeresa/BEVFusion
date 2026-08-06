@@ -80,10 +80,25 @@ def optimize_pillars(points: torch.Tensor, pillar_indices: torch.Tensor, max_poi
     """
     unique_indices, inverse = torch.unique(pillar_indices, dim=0, return_inverse=True)
     P = unique_indices.shape[0]
-    pillar_features = torch.zeros(P, max_points_per_pillar, points.shape[1], device=points.device)
 
-    for i in range(P):
-        pts = points[inverse == i][:max_points_per_pillar]
-        pillar_features[i, :pts.shape[0]] = pts
+    # Vectorized per-pillar slot assignment instead of a Python loop over pillars
+    # (see _cluster_centers in point_pillars.py for why). Rank = each point's
+    # position within its own pillar, in original point order — computed via a
+    # stable sort by pillar so equal-pillar points keep their relative order,
+    # then position-within-run via cumcount-per-group.
+    order          = torch.argsort(inverse, stable=True)
+    sorted_inverse = inverse[order]
+    is_group_start = torch.ones_like(sorted_inverse, dtype=torch.bool)
+    is_group_start[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
+    group_start_pos = torch.zeros(P, dtype=torch.long, device=points.device)
+    group_start_pos[sorted_inverse[is_group_start]] = torch.nonzero(is_group_start, as_tuple=True)[0]
+    rank_sorted = torch.arange(len(sorted_inverse), device=points.device) - group_start_pos[sorted_inverse]
+    rank = torch.empty_like(rank_sorted)
+    rank[order] = rank_sorted
+
+    keep = rank < max_points_per_pillar
+    pillar_features = torch.zeros(P, max_points_per_pillar, points.shape[1],
+                                  device=points.device, dtype=points.dtype)
+    pillar_features[inverse[keep], rank[keep]] = points[keep]
 
     return pillar_features, unique_indices

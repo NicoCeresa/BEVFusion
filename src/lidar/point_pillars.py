@@ -32,15 +32,18 @@ class PointPillars(nn.Module):
         self.backbone = PillarBackbone(C=C)
 
     def _cluster_centers(self, points: torch.Tensor, pillar_indices: torch.Tensor) -> torch.Tensor:
-        unique, inverse = torch.unique(pillar_indices, dim=0, return_inverse=True)
-        centers = torch.zeros(len(points), 3, device=points.device)
-        for i in range(len(unique)):
-            mask = inverse == i
-            centers[mask] = points[mask, :3].mean(dim=0)
-        return centers
+        # Scatter-mean per pillar (index_add_) then gather back per point, instead
+        # of a Python loop over pillars — thousands of tiny GPU ops per sample was
+        # the dominant cost in training (GPU sat mostly idle waiting on launches).
+        unique, inverse, counts = torch.unique(pillar_indices, dim=0, return_inverse=True, return_counts=True)
+        sums = torch.zeros(unique.shape[0], 3, device=points.device, dtype=points.dtype)
+        sums.index_add_(0, inverse, points[:, :3])
+        means = sums / counts.unsqueeze(1).to(points.dtype)
+        return means[inverse]
 
     def _scatter(self, pillar_features: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        bev = torch.zeros(self.C, self.grid_height, self.grid_width, device=pillar_features.device)
+        bev = torch.zeros(self.C, self.grid_height, self.grid_width,
+                          device=pillar_features.device, dtype=pillar_features.dtype)
         bev[:, indices[:, 1], indices[:, 0]] = pillar_features.T
         return bev
 

@@ -424,7 +424,7 @@ class LiftSplatShoot(nn.Module):
         else:
             x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
 
-        final = torch.zeros((B, C, int(self.nx[2]), int(self.nx[0]), int(self.nx[1])), device=x.device)
+        final = torch.zeros((B, C, int(self.nx[2]), int(self.nx[0]), int(self.nx[1])), device=x.device, dtype=x.dtype)
         final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]] = x
 
         final = torch.cat(final.unbind(dim=2), 1)

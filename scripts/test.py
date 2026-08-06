@@ -46,7 +46,7 @@ NUM_SAMPLES    = 10
 # ---------------------------------------------------------------------------
 
 def decode_reg(anchors, reg):
-    """Inverse of encode_reg from train.py. anchors, reg: (N, 7) → (N, 7) boxes."""
+    """Inverse of encode_reg from train.py. anchors: (N, 7), reg: (N, 9) → (N, 9) boxes."""
     diag  = torch.sqrt(anchors[:, 3] ** 2 + anchors[:, 4] ** 2)
     x     = anchors[:, 0] + reg[:, 0] * diag
     y     = anchors[:, 1] + reg[:, 1] * diag
@@ -55,24 +55,26 @@ def decode_reg(anchors, reg):
     l     = anchors[:, 4] * torch.exp(reg[:, 4])
     h     = anchors[:, 5] * torch.exp(reg[:, 5])
     theta = anchors[:, 6] + torch.arcsin(reg[:, 6].clamp(-1, 1))
-    return torch.stack([x, y, z, w, l, h, theta], dim=1)
+    vx    = reg[:, 7]
+    vy    = reg[:, 8]
+    return torch.stack([x, y, z, w, l, h, theta, vx, vy], dim=1)
 
 
 def decode_predictions(pred_cls, pred_reg, anchors):
     """
     pred_cls: (1, A*C, H, W)
-    pred_reg: (1, A*7, H, W)
-    Returns boxes (N, 7), scores (N,), labels (N,) — all above SCORE_THRESH.
+    pred_reg: (1, A*9, H, W)
+    Returns boxes (N, 9), scores (N,), labels (N,) — all above SCORE_THRESH.
     """
     cls_scores = torch.sigmoid(pred_cls[0]).permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES)
-    reg_preds  = pred_reg[0].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 7)
+    reg_preds  = pred_reg[0].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 9)
 
     scores, labels = cls_scores.max(dim=-1)   # (H, W, A)
     keep = scores > SCORE_THRESH
 
     if not keep.any():
         empty = torch.zeros(0)
-        return torch.zeros(0, 7), empty, empty.long()
+        return torch.zeros(0, 9), empty, empty.long()
 
     anchors_grid  = anchors.view(BEV_H, BEV_W, NUM_ANCHORS, 7)
     kept_anchors  = anchors_grid[keep]
@@ -89,7 +91,7 @@ def decode_predictions(pred_cls, pred_reg, anchors):
 # ---------------------------------------------------------------------------
 
 def iou_bev_pair(boxes, ref_box):
-    """Axis-aligned 2D IoU between (N, 7) boxes and a single (7,) ref_box."""
+    """Axis-aligned 2D IoU between (N, 7+) boxes and a single (7+,) ref_box (only xy/wl are used)."""
     ax1 = boxes[:, 0] - boxes[:, 3] / 2;  ax2 = boxes[:, 0] + boxes[:, 3] / 2
     ay1 = boxes[:, 1] - boxes[:, 4] / 2;  ay2 = boxes[:, 1] + boxes[:, 4] / 2
     gx1 = ref_box[0] - ref_box[3] / 2;    gx2 = ref_box[0] + ref_box[3] / 2
@@ -120,8 +122,8 @@ def nms(boxes, scores):
     return kept
 
 def box_corners(box):
-    """4 BEV corners of a box (7,) → (4, 2) in ego metres."""
-    x, y, _, w, l, _, theta = box
+    """4 BEV corners of a box (7,) or (9,) → (4, 2) in ego metres."""
+    x, y, _, w, l, _, theta = box[:7]
     c, s = np.cos(theta), np.sin(theta)
     corners = np.array([[-w/2, -l/2], [w/2, -l/2], [w/2, l/2], [-w/2, l/2]])
     rot = np.array([[c, -s], [s, c]])

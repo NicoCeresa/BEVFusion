@@ -2,10 +2,10 @@
 Evaluate a trained checkpoint on nuScenes using the official devkit metrics.
 
 Reports mAP (real, comparable to published baselines) plus the translation/
-scale/orientation TP errors. mAVE and mAAE are not reported: this model has no
-velocity or attribute head, so submitting velocity=(0,0)/attribute_name=""
-would pin those two error terms near their worst value regardless of
-detection quality, deflating NDS for reasons unrelated to the detector.
+scale/orientation/velocity TP errors. mAAE is not reported: this model has no
+attribute head, so submitting attribute_name="" would pin that error term
+near its worst value regardless of detection quality, deflating NDS for
+reasons unrelated to the detector.
 """
 import sys
 import json
@@ -65,10 +65,11 @@ def fast_nms(boxes, scores):
 
 
 def ego_to_global(box, ego_t, ego_r):
-    x, y, z, w, l, h, yaw = box
+    x, y, z, w, l, h, yaw, vx, vy = box
     xyz = ego_r.rotate(np.array([x, y, z])) + ego_t
     rot = ego_r * Quaternion(axis=[0, 0, 1], angle=float(yaw))
-    return xyz, [float(w), float(l), float(h)], rot
+    vel = ego_r.rotate(np.array([vx, vy, 0.0]))[:2]  # vector, not a position — rotate only
+    return xyz, [float(w), float(l), float(h)], rot, vel
 
 
 def build_submission(model, dataset, nusc, anchors, device, sample_indices, max_boxes_per_sample):
@@ -109,13 +110,13 @@ def build_submission(model, dataset, nusc, anchors, device, sample_indices, max_
 
         entries = []
         for box, score, label in zip(boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy()):
-            xyz, size, rot = ego_to_global(box, ego_t, ego_r)
+            xyz, size, rot, vel = ego_to_global(box, ego_t, ego_r)
             entries.append({
                 'sample_token':    sample_token,
                 'translation':     xyz.tolist(),
                 'size':            size,
                 'rotation':        rot.elements.tolist(),
-                'velocity':        [0.0, 0.0],
+                'velocity':        vel.tolist(),
                 'detection_name':  OUR_CLASSES[int(label)],
                 'detection_score': float(score),
                 'attribute_name':  '',
@@ -191,16 +192,17 @@ def evaluate():
 
     print("\nTP errors at dist_th_tp=2m (lower is better):")
     tp_scores = []
-    for metric_name, label in [('trans_err', 'ATE (m)'), ('scale_err', 'ASE (1-IOU)'), ('orient_err', 'AOE (rad)')]:
+    for metric_name, label in [('trans_err', 'ATE (m)'), ('scale_err', 'ASE (1-IOU)'),
+                                ('orient_err', 'AOE (rad)'), ('vel_err', 'AVE (m/s)')]:
         per_class = {c: metrics.get_label_tp(c, metric_name) for c in OUR_CLASSES}
         mean_err  = float(np.mean(list(per_class.values())))
         tp_scores.append(max(0.0, 1.0 - mean_err))
         print(f"  {label:14s} " + ", ".join(f"{c}={v:.3f}" for c, v in per_class.items()) + f"  (mean={mean_err:.3f})")
-    print("  AVE / AAE:     N/A — model has no velocity or attribute head")
+    print("  AAE:           N/A — model has no attribute head")
 
     partial_nds = (det_cfg.mean_ap_weight * mAP + sum(tp_scores)) / (det_cfg.mean_ap_weight + len(tp_scores))
-    print(f"\nPartial NDS (mAP + ATE/ASE/AOE only, excludes AVE/AAE): {partial_nds:.4f}")
-    print("(Not directly comparable to published full-NDS numbers, which include velocity/attribute terms.)")
+    print(f"\nPartial NDS (mAP + ATE/ASE/AOE/AVE, excludes AAE): {partial_nds:.4f}")
+    print("(Not directly comparable to published full-NDS numbers, which include the attribute term.)")
 
 
 if __name__ == "__main__":

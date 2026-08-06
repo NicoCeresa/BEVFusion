@@ -3,16 +3,17 @@ import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.splits import create_splits_scenes
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from fusion.pipeline import BEVFusion
-from dataloader import NuScenesDataset, collate_fn
+from dataloader import NuScenesDataset, collate_fn, available_scene_names
 
 with open(ROOT / "config.yaml") as f:
     cfg = yaml.safe_load(f)
@@ -29,7 +30,7 @@ BEV_H, BEV_W = 200, 200
 X_MIN, X_MAX  = -50.0, 50.0
 Y_MIN, Y_MAX  = -50.0, 50.0
 NUM_CLASSES   = 3
-EPOCHS = 2
+EPOCHS = 15
 
 # Per-class anchors: (class_idx, w, l, h, rotation_rad)
 # Each class gets anchors sized to match its typical object dimensions.
@@ -78,7 +79,7 @@ def generate_anchors(device: torch.device) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def iou_bev(anchors: torch.Tensor, gt_box: torch.Tensor) -> torch.Tensor:
-    """Axis-aligned 2D IoU between (N, 7) anchors and a single (7,) GT box."""
+    """Axis-aligned 2D IoU between (N, 7) anchors and a single (9,) GT box (only xy/wl are used)."""
     ax1 = anchors[:, 0] - anchors[:, 3] / 2
     ax2 = anchors[:, 0] + anchors[:, 3] / 2
     ay1 = anchors[:, 1] - anchors[:, 4] / 2
@@ -96,8 +97,13 @@ def iou_bev(anchors: torch.Tensor, gt_box: torch.Tensor) -> torch.Tensor:
 
 
 def encode_reg(anchors: torch.Tensor, gt_box: torch.Tensor) -> torch.Tensor:
-    """PointPillars-style regression encoding. anchors: (N, 7), gt_box: (7,) → (N, 7)."""
+    """PointPillars-style regression encoding. anchors: (N, 7), gt_box: (9,) → (N, 9).
+
+    Velocity (gt_box[7:9]) has no anchor prior to encode relative to — anchors
+    are static templates — so it's carried through as a direct regression target.
+    """
     diag = torch.sqrt(anchors[:, 3] ** 2 + anchors[:, 4] ** 2)
+    N = anchors.shape[0]
     return torch.stack([
         (gt_box[0] - anchors[:, 0]) / diag,
         (gt_box[1] - anchors[:, 1]) / diag,
@@ -106,6 +112,8 @@ def encode_reg(anchors: torch.Tensor, gt_box: torch.Tensor) -> torch.Tensor:
         torch.log(gt_box[4] / anchors[:, 4]),
         torch.log(gt_box[5] / anchors[:, 5]),
         torch.sin(gt_box[6] - anchors[:, 6]),
+        gt_box[7].expand(N),
+        gt_box[8].expand(N),
     ], dim=1)
 
 
@@ -119,13 +127,13 @@ def build_targets(anchors, gt_boxes, gt_labels, device):
 
     Returns:
         cls_targets (H, W, A, C)  — binary per-class labels
-        reg_targets (H, W, A, 7)  — encoded box deltas (only valid at pos anchors)
+        reg_targets (H, W, A, 9)  — encoded box deltas (only valid at pos anchors)
         pos_mask    (H, W, A)     — True where anchor matched a GT box
         loss_mask   (H, W, A)     — True for pos + neg anchors (ignore ambiguous)
     """
     N = BEV_H * BEV_W * NUM_ANCHORS
     cls_targets = torch.zeros(N, NUM_CLASSES, device=device)
-    reg_targets = torch.zeros(N, 7, device=device)
+    reg_targets = torch.zeros(N, 9, device=device)
     pos_mask    = torch.zeros(N, dtype=torch.bool, device=device)
     neg_mask    = torch.ones(N, dtype=torch.bool, device=device)
 
@@ -155,7 +163,7 @@ def build_targets(anchors, gt_boxes, gt_labels, device):
 
     return (
         cls_targets.view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES),
-        reg_targets.view(BEV_H, BEV_W, NUM_ANCHORS, 7),
+        reg_targets.view(BEV_H, BEV_W, NUM_ANCHORS, 9),
         pos_mask.view(BEV_H, BEV_W, NUM_ANCHORS),
         (pos_mask | neg_mask).view(BEV_H, BEV_W, NUM_ANCHORS),
     )
@@ -192,7 +200,7 @@ def compute_loss(pred_cls, pred_reg, gt_boxes_batch, gt_labels_batch, anchors):
 
         # (A*C, H, W) → (H, W, A, C)
         cls_pred = pred_cls[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES)
-        reg_pred = pred_reg[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 7)
+        reg_pred = pred_reg[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 9)
 
         cls_loss_total += focal_loss(cls_pred, cls_targets)[loss_mask].sum()
 
@@ -214,12 +222,16 @@ def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on {device}")
 
-    nusc    = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
-    dataset = NuScenesDataset(nusc)
+    nusc = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
 
-    n_val   = max(1, int(0.2 * len(dataset)))
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val])
+    # Split by scene (nuScenes' own train/val scene assignment, restricted to
+    # whatever's actually on disk) rather than by individual sample — a random
+    # sample-level split would leak correlated frames from the same drive
+    # across both sets.
+    splits    = create_splits_scenes()
+    available = available_scene_names(nusc)
+    train_set = NuScenesDataset(nusc, scene_names=set(splits['train']) & available)
+    val_set   = NuScenesDataset(nusc, scene_names=set(splits['val']) & available)
 
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  num_workers=2, collate_fn=collate_fn)
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, num_workers=2, collate_fn=collate_fn)
