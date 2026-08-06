@@ -1,3 +1,4 @@
+import os
 import sys
 import yaml
 import torch
@@ -233,8 +234,9 @@ def train():
     train_set = NuScenesDataset(nusc, scene_names=set(splits['train']) & available)
     val_set   = NuScenesDataset(nusc, scene_names=set(splits['val']) & available)
 
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  num_workers=2, collate_fn=collate_fn)
-    val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, num_workers=2, collate_fn=collate_fn)
+    num_workers  = os.cpu_count()
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn)
+    val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
     model = BEVFusion(
         lss_weights   = cfg['weights']['lss'],
