@@ -24,7 +24,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion
+from fusion.pipeline import BEVFusion, load_checkpoint
 from dataloader import NuScenesDataset, available_scene_names
 from train import EPOCHS, NUM_ANCHORS, generate_anchors
 import test as test_mod  # reuse decode_predictions/nms — must stay in sync with train.py's encoding
@@ -38,7 +38,7 @@ GRID_CONF = {
     'zbound': cfg['camera']['zbound'],
     'dbound': cfg['camera']['dbound'],
 }
-DATA_AUG_CONF = {'final_dim': (128, 352)}
+DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 
 OUR_CLASSES = ['car', 'pedestrian', 'bicycle']
 
@@ -166,7 +166,7 @@ def evaluate(ckpt_path=None):
         data_aug_conf = DATA_AUG_CONF,
         num_anchors   = NUM_ANCHORS,
     ).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    load_checkpoint(model, ckpt_path, device)
     model.eval()
 
     anchors = generate_anchors(device)

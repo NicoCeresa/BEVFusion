@@ -22,7 +22,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion
+from fusion.pipeline import BEVFusion, load_checkpoint
 from dataloader import NuScenesDataset, CAMERAS
 from train import NUM_ANCHORS
 
@@ -35,7 +35,7 @@ GRID_CONF = {
     'zbound': cfg['camera']['zbound'],
     'dbound': cfg['camera']['dbound'],
 }
-DATA_AUG_CONF = {'final_dim': (128, 352)}
+DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 DATA_DIR = ROOT / "data"
 
 
@@ -91,7 +91,7 @@ def main(sample_idx=0):
         data_aug_conf = DATA_AUG_CONF,
         num_anchors   = NUM_ANCHORS,
     ).to(device)
-    model.load_state_dict(torch.load(ROOT / "checkpoints" / "bevfusion_epoch10.pt", map_location=device))
+    load_checkpoint(model, ROOT / "checkpoints" / "bevfusion_epoch10.pt", device)
     model.eval()
 
     images     = sample['images'].unsqueeze(0).to(device)

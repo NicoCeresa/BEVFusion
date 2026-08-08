@@ -24,7 +24,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion
+from fusion.pipeline import BEVFusion, load_checkpoint
 from dataloader import NuScenesDataset, available_scene_names
 from train import NUM_ANCHORS
 
@@ -32,7 +32,7 @@ with open(ROOT / "config.yaml") as f:
     cfg = yaml.safe_load(f)
 
 GRID_CONF = {k: cfg['camera'][k] for k in ('xbound', 'ybound', 'zbound', 'dbound')}
-DATA_AUG_CONF = {'final_dim': (128, 352)}
+DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 CALIB_DIR = ROOT / "data" / "calib"
 
 MAX_PILLARS, MAX_PTS = 10000, 32
@@ -84,7 +84,7 @@ def main(num_samples=8):
 
     model = BEVFusion(lss_weights=cfg['weights']['lss'], grid_conf=GRID_CONF,
                       data_aug_conf=DATA_AUG_CONF, num_anchors=NUM_ANCHORS).to(device)
-    model.load_state_dict(torch.load(ROOT / "checkpoints" / "bevfusion_epoch10.pt", map_location=device))
+    load_checkpoint(model, ROOT / "checkpoints" / "bevfusion_epoch10.pt", device)
     model.eval()
     cam = model.camera_encoder
 

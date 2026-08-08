@@ -1,36 +1,20 @@
 import os
 import sys
-import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import create_splits_scenes
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion
-from dataloader import NuScenesDataset, collate_fn, available_scene_names, CLASS_MAP
+from dataloader import NuScenesDataset, collate_fn, CLASS_MAP
+from common import (cfg, BEV_H, BEV_W, NUM_CLASSES, NUM_ANCHORS, ANCHOR_CLASSES,
+                    generate_anchors, build_model, split_scene_names)
 
-with open(ROOT / "config.yaml") as f:
-    cfg = yaml.safe_load(f)
-
-GRID_CONF = {
-    'xbound': cfg['camera']['xbound'],
-    'ybound': cfg['camera']['ybound'],
-    'zbound': cfg['camera']['zbound'],
-    'dbound': cfg['camera']['dbound'],
-}
-DATA_AUG_CONF = {'final_dim': (128, 352)}
-
-BEV_H, BEV_W = 200, 200
-X_MIN, X_MAX  = -50.0, 50.0
-Y_MIN, Y_MAX  = -50.0, 50.0
-NUM_CLASSES   = 3
 EPOCHS = 15
 # Epochs of no val-loss improvement before stopping; None disables.
 # Off by default: on the 15-epoch trainval01 run, val loss was a poor proxy for
@@ -40,19 +24,6 @@ EPOCHS = 15
 # never produced that checkpoint. Enable only if you've confirmed val loss
 # tracks mAP on your data.
 EARLY_STOP_PATIENCE = None
-
-# Per-class anchors: (class_idx, w, l, h, rotation_rad)
-# Each class gets anchors sized to match its typical object dimensions.
-ANCHORS = [
-    (0, 4.73, 2.08, 1.77, 0.0),     # car, 0°
-    (0, 4.73, 2.08, 1.77, 1.5708),  # car, 90°
-    (1, 0.76, 0.76, 1.73, 0.0),     # pedestrian (symmetric — 1 rotation)
-    (2, 1.76, 0.60, 1.73, 0.0),     # bicycle, 0°
-    (2, 1.76, 0.60, 1.73, 1.5708),  # bicycle, 90°
-]
-NUM_ANCHORS    = len(ANCHORS)        # 5
-ANCHOR_CLASSES = [a[0] for a in ANCHORS]   # [0, 0, 1, 2, 2]
-ANCHOR_Z       = -1.0
 
 POS_IOU_THRESH = 0.50
 NEG_IOU_THRESH = 0.35
@@ -66,31 +37,6 @@ NEG_IOU_THRESH = 0.35
 # overall), so CBGS's frame-level oversampling has little effect on it. This
 # weight is doing most of the actual correction instead.
 CLASS_WEIGHTS = torch.tensor([1.0, 1.0, 6.0])  # car, pedestrian, bicycle
-
-
-# ---------------------------------------------------------------------------
-# Anchor generation
-# ---------------------------------------------------------------------------
-
-def generate_anchors(device: torch.device) -> torch.Tensor:
-    """Returns (BEV_H * BEV_W * NUM_ANCHORS, 7). Ordered (H, W, A) so .view works."""
-    xs = torch.linspace(X_MIN, X_MAX, BEV_W + 1)[:-1] + (X_MAX - X_MIN) / BEV_W / 2
-    ys = torch.linspace(Y_MIN, Y_MAX, BEV_H + 1)[:-1] + (Y_MAX - Y_MIN) / BEV_H / 2
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # (H, W)
-
-    per_anchor = []
-    for _, w, l, h, rot in ANCHORS:
-        per_anchor.append(torch.stack([
-            grid_x,
-            grid_y,
-            torch.full_like(grid_x, ANCHOR_Z),
-            torch.full_like(grid_x, w),
-            torch.full_like(grid_x, l),
-            torch.full_like(grid_x, h),
-            torch.full_like(grid_x, rot),
-        ], dim=-1))  # (H, W, 7)
-
-    return torch.stack(per_anchor, dim=2).view(-1, 7).to(device)  # (H*W*A, 7)
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +228,8 @@ def train():
     # whatever's actually on disk) rather than by individual sample — a random
     # sample-level split would leak correlated frames from the same drive
     # across both sets.
-    splits    = create_splits_scenes()
-    available = available_scene_names(nusc)
-    train_set = NuScenesDataset(nusc, scene_names=set(splits['train']) & available)
-    val_set   = NuScenesDataset(nusc, scene_names=set(splits['val']) & available)
+    train_set = NuScenesDataset(nusc, scene_names=split_scene_names(nusc, 'train'))
+    val_set   = NuScenesDataset(nusc, scene_names=split_scene_names(nusc, 'val'))
 
     # CBGS oversampling on train only — val must stay representative of the
     # true distribution for an honest read on generalization.
@@ -296,12 +240,7 @@ def train():
     train_loader = DataLoader(train_set, batch_size=1, sampler=train_sampler, num_workers=num_workers, collate_fn=collate_fn)
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
-    model = BEVFusion(
-        lss_weights   = cfg['weights']['lss'],
-        grid_conf     = GRID_CONF,
-        data_aug_conf = DATA_AUG_CONF,
-        num_anchors   = NUM_ANCHORS,
-    ).to(device)
+    model = build_model(device, eval_mode=False)
 
     anchors   = generate_anchors(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)

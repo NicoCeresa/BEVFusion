@@ -1,5 +1,4 @@
 import sys
-import yaml
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,36 +7,20 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from pathlib import Path
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import create_splits_scenes
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion
-from dataloader import NuScenesDataset, available_scene_names
-from train import EPOCHS, NUM_ANCHORS, generate_anchors
+from dataloader import NuScenesDataset
+from train import EPOCHS
+from common import (cfg, BEV_H, BEV_W, X_MIN, X_MAX, Y_MIN, Y_MAX, NUM_CLASSES,
+                    NUM_ANCHORS, CLASS_NAMES, generate_anchors, build_model,
+                    split_scene_names)
 from visualize import lidar_height_rgb
-
-with open(ROOT / "config.yaml") as f:
-    cfg = yaml.safe_load(f)
-
-GRID_CONF = {
-    'xbound': cfg['camera']['xbound'],
-    'ybound': cfg['camera']['ybound'],
-    'zbound': cfg['camera']['zbound'],
-    'dbound': cfg['camera']['dbound'],
-}
-DATA_AUG_CONF = {'final_dim': (128, 352)}
-
-BEV_H, BEV_W = 200, 200
-X_MIN, X_MAX  = -50.0, 50.0
-Y_MIN, Y_MAX  = -50.0, 50.0
-NUM_CLASSES   = 3
 
 SCORE_THRESH   = 0.3
 NMS_IOU_THRESH = 0.3
-CLASS_NAMES    = ['car', 'pedestrian', 'bicycle']
 CLASS_COLORS   = ['#4488ff', '#44ff88', '#ff4444']
 NUM_SAMPLES    = 10
 
@@ -187,7 +170,7 @@ def test(ckpt_path=None):
         data_aug_conf = DATA_AUG_CONF,
         num_anchors   = NUM_ANCHORS,
     ).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    load_checkpoint(model, ckpt_path, device)
     model.eval()
 
     anchors = generate_anchors(device)

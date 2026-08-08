@@ -10,6 +10,36 @@ from fusion.bev_encoder import BEVEncoder
 from fusion.detection_head import SSD
 
 
+# Constants LSS derives from grid_conf/data_aug_conf in __init__ rather than
+# learning. They live in the state dict, and `frustum`'s shape depends on the
+# input image size — so loading pretrained weights saved at a different
+# resolution fails on shape mismatch. They're already correct from
+# construction, so drop them from the load instead of forcing a resize.
+LSS_DERIVED_KEYS = ("frustum", "dx", "bx", "nx")
+
+
+def load_checkpoint(model, path, device):
+    """Load a full BEVFusion checkpoint, ignoring LSS's derived constants.
+
+    Only `frustum` (and dx/bx/nx) depend on input resolution; every learned
+    weight is convolutional and therefore resolution-agnostic. Dropping the
+    derived keys lets a checkpoint trained at one image size load at another
+    — the constants are rebuilt correctly in __init__ either way.
+
+    Note this makes such a checkpoint *load*, not necessarily perform well:
+    features learned at one scale won't transfer perfectly to another, so
+    retraining is still advisable after a resolution change.
+    """
+    state = torch.load(path, map_location=device)
+    state = {k: v for k, v in state.items()
+             if k.rsplit(".", 1)[-1] not in LSS_DERIVED_KEYS}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if k.rsplit(".", 1)[-1] not in LSS_DERIVED_KEYS]
+    if missing or unexpected:
+        raise RuntimeError(f"checkpoint mismatch — missing: {missing}, unexpected: {unexpected}")
+    return model
+
+
 class BEVFusion(nn.Module):
     def __init__(self, lss_weights: str, grid_conf: dict, data_aug_conf: dict,
                  lidar_channels: int = 384, camera_channels: int = 1,
@@ -17,7 +47,13 @@ class BEVFusion(nn.Module):
         super().__init__()
 
         self.camera_encoder = compile_model(grid_conf, data_aug_conf, outC=camera_channels)
-        self.camera_encoder.load_state_dict(torch.load(lss_weights, map_location="cpu"))
+        lss_state = torch.load(lss_weights, map_location="cpu")
+        lss_state = {k: v for k, v in lss_state.items() if k not in LSS_DERIVED_KEYS}
+        missing, unexpected = self.camera_encoder.load_state_dict(lss_state, strict=False)
+        unexpected = [k for k in unexpected if k not in LSS_DERIVED_KEYS]
+        missing = [k for k in missing if k not in LSS_DERIVED_KEYS]
+        if missing or unexpected:
+            raise RuntimeError(f"LSS weight mismatch — missing: {missing}, unexpected: {unexpected}")
 
         self.lidar_encoder = PointPillars(
             voxel_size=(0.25, 0.25, 4.0),

@@ -16,14 +16,8 @@
 using namespace nvinfer1;
 using namespace nvonnxparser;
 
-// Must match src/lidar/point_pillars.py's PointPillars config and the shapes
-// scripts/export_onnx.py exported the engines with.
+// Must match src/lidar/point_pillars.py's PointPillars config.
 static const float VOXEL_X = 0.25f, VOXEL_Y = 0.25f, VOXEL_Z = 4.0f;
-static const int   PILLAR_GRID_W = 400, PILLAR_GRID_H = 400;
-static const int   MAX_PILLARS = 10000, MAX_PTS_PER_PILLAR = 32;
-static const int   PILLAR_C = 64;          // pointnet output channels
-static const int   LIDAR_BEV_C = 384;      // pillar_backbone output channels
-static const int   FUSED_C = 256;
 static const int   NUM_CLASSES = 3, NUM_ANCHORS = 5, REG_DIM = 9;
 
 static const float SCORE_THRESH = 0.3f;
@@ -93,10 +87,10 @@ void build_engine(const char* modelFile, const char* outputFile) {
     delete serializedModel;
 }
 
-void ensure_engine(const char* modelFile, const char* engineFile, const std::string& engine_name = "") {
+void ensure_engine(const char* modelFile, const char* engineFile) {
     if (!std::filesystem::exists(engineFile)) {
         std::cout << "Building " << engineFile << " (first run)" << std::endl;
-        build_engine(modelFile, engineFile, engine_name);
+        build_engine(modelFile, engineFile);
     }
 }
 
@@ -110,12 +104,9 @@ ICudaEngine* load_engine(const char* engineFile, IRuntime* runtime) {
 // Builds (on first use) and loads one sub-model. Precisions get separate
 // engine files so switching modes doesn't silently reuse the other's cache.
 ICudaEngine* prepare_engine(const std::string& name, IRuntime* runtime) {
-    const char* suffix = g_int8 ? ".int8.engine"
-                       : g_strict_fp32 ? ".fp32.engine"
-                       : ".engine";
     const std::string onnx   = "engines/" + name + ".onnx";
-    const std::string engine = "engines/" + name + suffix;
-    ensure_engine(onnx.c_str(), engine.c_str(), name);
+    const std::string engine = "engines/" + name + (g_strict_fp32 ? ".fp32.engine" : ".engine");
+    ensure_engine(onnx.c_str(), engine.c_str());
     return load_engine(engine.c_str(), runtime);
 }
 
@@ -182,20 +173,28 @@ std::vector<std::vector<float>> infer(ICudaEngine* engine, cudaStream_t stream,
     }
 }
 
+// Returns an engine tensor's shape, so dimensions come from the engine rather
+// than being duplicated as constants that go stale when the model changes.
+std::vector<int> tensor_shape(ICudaEngine* engine, int io_index) {
+    const Dims d = engine->getTensorShape(engine->getIOTensorName(io_index));
+    return std::vector<int>(d.d, d.d + d.nbDims);
+}
+
 // Scatters per-pillar features into the dense BEV grid — the C++ counterpart
 // of PointPillars._scatter. Output is (C, grid_h, grid_w).
 std::vector<float> scatter_pillars(const std::vector<float>& pillar_features,
                                    const std::vector<pillar_index>& indices,
-                                   int num_pillars) {
-    std::vector<float> bev(static_cast<size_t>(PILLAR_C) * PILLAR_GRID_H * PILLAR_GRID_W, 0.0f);
-    const int P = std::min(num_pillars, MAX_PILLARS);
+                                   int num_pillars, int channels,
+                                   int grid_h, int grid_w, int max_pillars) {
+    std::vector<float> bev(static_cast<size_t>(channels) * grid_h * grid_w, 0.0f);
+    const int P = std::min(num_pillars, max_pillars);
 
     for (int p = 0; p < P; p++) {
         const int ix = indices[p].ix, iy = indices[p].iy;
-        if (ix < 0 || ix >= PILLAR_GRID_W || iy < 0 || iy >= PILLAR_GRID_H) continue;
-        for (int c = 0; c < PILLAR_C; c++)
-            bev[(static_cast<size_t>(c) * PILLAR_GRID_H + iy) * PILLAR_GRID_W + ix] =
-                pillar_features[static_cast<size_t>(p) * PILLAR_C + c];
+        if (ix < 0 || ix >= grid_w || iy < 0 || iy >= grid_h) continue;
+        for (int c = 0; c < channels; c++)
+            bev[(static_cast<size_t>(c) * grid_h + iy) * grid_w + ix] =
+                pillar_features[static_cast<size_t>(p) * channels + c];
     }
     return bev;
 }
@@ -208,15 +207,20 @@ struct detection {
 
 // Inverse of encode_reg in scripts/train.py; mirrors decode_predictions in
 // scripts/test.py.
-std::vector<detection> decode(const std::vector<float>& pred_cls,
+std::vector<detection> decode(const GeometryConfig& g,
+                              const std::vector<float>& pred_cls,
                               const std::vector<float>& pred_reg) {
     std::vector<detection> dets;
+    const int bev_x = g.nx[0], bev_y = g.nx[1];
+    // Anchor grid spans the same bounds as the BEV grid, so derive the cell
+    // centres from it rather than repeating the -50..50 / 0.5 literals.
+    const float x_min = g.bx[0] - g.dx[0] / 2.0f;
+    const float y_min = g.bx[1] - g.dx[1] / 2.0f;
 
-    for (int h = 0; h < BEV_Y; h++) {
-        for (int w = 0; w < BEV_X; w++) {
-            // Anchor grid centres, matching generate_anchors in train.py.
-            const float ax_center = -50.0f + static_cast<float>(w) * 0.5f + 0.25f;
-            const float ay_center = -50.0f + static_cast<float>(h) * 0.5f + 0.25f;
+    for (int h = 0; h < bev_y; h++) {
+        for (int w = 0; w < bev_x; w++) {
+            const float ax_center = x_min + (static_cast<float>(w) + 0.5f) * g.dx[0];
+            const float ay_center = y_min + (static_cast<float>(h) + 0.5f) * g.dx[1];
 
             for (int a = 0; a < NUM_ANCHORS; a++) {
                 const anchor_template& t = ANCHOR_TEMPLATES[a];
@@ -225,7 +229,7 @@ std::vector<detection> decode(const std::vector<float>& pred_cls,
                 float best_score = -1.0f;
                 for (int c = 0; c < NUM_CLASSES; c++) {
                     const size_t idx =
-                        (static_cast<size_t>(a * NUM_CLASSES + c) * BEV_Y + h) * BEV_X + w;
+                        (static_cast<size_t>(a * NUM_CLASSES + c) * bev_y + h) * bev_x + w;
                     const float score = 1.0f / (1.0f + std::exp(-pred_cls[idx]));
                     if (score > best_score) { best_score = score; best_cls = c; }
                 }
@@ -233,7 +237,7 @@ std::vector<detection> decode(const std::vector<float>& pred_cls,
 
                 float r[REG_DIM];
                 for (int k = 0; k < REG_DIM; k++)
-                    r[k] = pred_reg[(static_cast<size_t>(a * REG_DIM + k) * BEV_Y + h) * BEV_X + w];
+                    r[k] = pred_reg[(static_cast<size_t>(a * REG_DIM + k) * bev_y + h) * bev_x + w];
 
                 const float diag = std::sqrt(t.w * t.w + t.l * t.l);
                 detection d;
@@ -300,12 +304,10 @@ int main(int argc, char** argv) {
         // stb-vs-PIL decode differences.
         if (arg == "--ref-images")       use_ref_images = true;
         else if (arg == "--strict-fp32") g_strict_fp32 = true;
-        else if (arg == "--int8")        g_int8 = true;
         else                             data_dir = arg;
     }
     IRuntime* runtime = createInferRuntime(logger);
     if (g_strict_fp32) std::cout << "(TF32 disabled)" << std::endl;
-    if (g_int8)        std::cout << "(INT8 quantization enabled)" << std::endl;
 
     ICudaEngine* cam_encode      = prepare_engine("cam_encode", runtime);
     ICudaEngine* bev_encode      = prepare_engine("bev_encode", runtime);
@@ -317,6 +319,50 @@ int main(int argc, char** argv) {
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
+    // Grid bounds come from config.yaml via dump_grid_config.py; every tensor
+    // dimension is read off the engines themselves, so changing camera
+    // resolution or BEV size needs no edit here.
+    GeometryConfig geo = load_grid_config(data_dir + "/grid_config.txt");
+    {
+        // Cross-check against the engine's real I/O. An engine exported at a
+        // different resolution than config.yaml would otherwise produce
+        // silently misaligned BEV features rather than an error.
+        const std::vector<int> in  = tensor_shape(cam_encode, 0);   // (N, 3, H, W)
+        const std::vector<int> out = tensor_shape(cam_encode, 1);   // (N, C, D, fH, fW)
+        if (in.size() != 4 || out.size() != 5)
+            throw std::runtime_error("unexpected cam_encode tensor ranks");
+
+        const std::pair<const char*, std::pair<int, int>> checks[] = {
+            {"n_cams",     {geo.n_cams,     in[0]}},
+            {"img_h",      {geo.img_h,      in[2]}},
+            {"img_w",      {geo.img_w,      in[3]}},
+            {"cam_c",      {geo.cam_c,      out[1]}},
+            {"depth_bins", {geo.depth_bins, out[2]}},
+            {"feat_h",     {geo.feat_h,     out[3]}},
+            {"feat_w",     {geo.feat_w,     out[4]}},
+        };
+        for (const auto& c : checks) {
+            if (c.second.first != c.second.second)
+                throw std::runtime_error(
+                    std::string("grid_config ") + c.first + "=" + std::to_string(c.second.first) +
+                    " but cam_encode engine says " + std::to_string(c.second.second) +
+                    " — re-run scripts/export_onnx.py and delete engines/*.engine");
+        }
+    }
+    std::printf("geometry: %d cams, %dx%d -> %dx%d feat, %d depth bins, %d ch;"
+                " BEV %dx%dx%d\n",
+                geo.n_cams, geo.img_h, geo.img_w, geo.feat_h, geo.feat_w,
+                geo.depth_bins, geo.cam_c, geo.nx[0], geo.nx[1], geo.nx[2]);
+
+    // Pillar shapes likewise come from the pointnet/backbone engines.
+    const std::vector<int> pn_in   = tensor_shape(pointnet, 0);          // (P, pts, 9)
+    const std::vector<int> pn_out  = tensor_shape(pointnet, 1);          // (P, C)
+    const std::vector<int> pb_in   = tensor_shape(pillar_backbone, 0);   // (1, C, gh, gw)
+    const int max_pillars   = pn_in[0];
+    const int pts_per_pillar = pn_in[1];
+    const int pillar_c      = pn_out[1];
+    const int pillar_grid_h = pb_in[2], pillar_grid_w = pb_in[3];
+
     // ---- camera branch: images -> lifted features -> BEV -> bev_encode ----
     std::vector<std::string> image_paths = {
         data_dir + "/CAM_FRONT.jpg",      data_dir + "/CAM_FRONT_RIGHT.jpg",
@@ -325,19 +371,19 @@ int main(int argc, char** argv) {
     };
     std::vector<float> cam_input = use_ref_images
         ? read_f32(data_dir + "/ref_images.bin")
-        : load_and_preprocess_images(image_paths);
+        : load_and_preprocess_images(image_paths, geo.img_h, geo.img_w);
     if (use_ref_images) std::cout << "(using PyTorch reference images)" << std::endl;
     std::vector<float> cam_feats = infer(cam_encode, stream, {&cam_input})[0];
     std::cout << "cam_encode      -> " << cam_feats.size() << " floats" << std::endl;
 
-    const std::vector<float> frustum = create_frustum();
-    const std::vector<float> geom = get_geometry(frustum,
+    const std::vector<float> frustum = create_frustum(geo);
+    const std::vector<float> geom = get_geometry(geo, frustum,
                                                  read_f32(data_dir + "/rots.bin"),
                                                  read_f32(data_dir + "/trans.bin"),
                                                  read_f32(data_dir + "/intrins.bin"),
                                                  read_f32(data_dir + "/post_rots.bin"),
                                                  read_f32(data_dir + "/post_trans.bin"));
-    std::vector<float> pooled = voxel_pooling(geom, cam_feats);
+    std::vector<float> pooled = voxel_pooling(geo, geom, cam_feats);
     std::cout << "voxel_pooling   -> " << pooled.size() << " floats" << std::endl;
 
     std::vector<float> camera_bev = infer(bev_encode, stream, {&pooled})[0];
@@ -347,15 +393,17 @@ int main(int argc, char** argv) {
     voxel_size vs{VOXEL_X, VOXEL_Y, VOXEL_Z};
     point_cloud_range range{-50.f, 50.f, -50.f, 50.f, -5.f, 3.f};
     lidar_pillars pillars = run_lidar_pipeline(data_dir + "/LIDAR_TOP.bin", vs, range,
-                                               MAX_PTS_PER_PILLAR, MAX_PILLARS);
+                                               pts_per_pillar, max_pillars);
     std::cout << "pillarize       -> " << pillars.num_pillars << " pillars";
-    if (pillars.num_pillars > MAX_PILLARS)
-        std::cout << " (truncated to " << MAX_PILLARS << ")";
+    if (pillars.num_pillars > max_pillars)
+        std::cout << " (truncated to " << max_pillars << ")";
     std::cout << std::endl;
 
     std::vector<float> pillar_feats = infer(pointnet, stream, {&pillars.features})[0];
     std::vector<float> lidar_scattered = scatter_pillars(pillar_feats, pillars.indices,
-                                                         pillars.num_pillars);
+                                                         pillars.num_pillars, pillar_c,
+                                                         pillar_grid_h, pillar_grid_w,
+                                                         max_pillars);
     std::vector<float> lidar_bev = infer(pillar_backbone, stream, {&lidar_scattered})[0];
     std::cout << "pillar_backbone -> " << lidar_bev.size() << " floats" << std::endl;
 
@@ -370,9 +418,7 @@ int main(int argc, char** argv) {
               << ", reg " << pred_reg.size() << " floats" << std::endl;
 
     // Dumped so scripts/compare_cpp.py can diff every stage against PyTorch.
-    // INT8 writes to its own prefix so a quantized run doesn't clobber the
-    // FP32 outputs it's meant to be compared against.
-    const std::string p = data_dir + (g_int8 ? "/int8_" : "/cpp_");
+    const std::string p = data_dir + "/cpp_";
     write_f32(p + "cam_input.bin", cam_input);
     write_f32(p + "cam_encode_raw.bin", cam_feats);
     write_f32(p + "voxel_pooled.bin", pooled);
@@ -409,10 +455,10 @@ int main(int argc, char** argv) {
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0).count() / iters;
         std::printf("\nengine chain: %.1f ms/frame over %d iters (%s)\n",
-                    ms, iters, g_int8 ? "INT8" : (g_strict_fp32 ? "FP32 strict" : "FP32/TF32"));
+                    ms, iters, g_strict_fp32 ? "FP32 strict" : "FP32/TF32");
     }
 
-    std::vector<detection> dets = nms(decode(pred_cls, pred_reg));
+    std::vector<detection> dets = nms(decode(geo, pred_cls, pred_reg));
     std::cout << "\n" << dets.size() << " detections above score " << SCORE_THRESH << std::endl;
     for (size_t i = 0; i < dets.size() && i < 20; i++) {
         const detection& d = dets[i];

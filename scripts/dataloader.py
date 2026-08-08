@@ -1,3 +1,4 @@
+import yaml
 import torch
 import numpy as np
 from pathlib import Path
@@ -11,7 +12,12 @@ CAMERAS = [
     'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT',
     'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT',
 ]
-IMG_SIZE = (128, 352)  # H, W — must match LSS pretrained grid
+
+# Single source of truth for input resolution — it also determines the LSS
+# frustum shape, so it has to agree across the dataloader, the model, and the
+# C++ engine. Keeping separate copies is how they drift out of sync.
+with open(Path(__file__).parent.parent / "config.yaml") as _f:
+    IMG_SIZE = tuple(yaml.safe_load(_f)['camera']['image_size'])  # H, W
 
 # LIDAR_TOP spins at ~20Hz but nuScenes only annotates the 2Hz keyframes, so a
 # single keyframe scan is sparse. Aggregating the preceding sweeps (motion-

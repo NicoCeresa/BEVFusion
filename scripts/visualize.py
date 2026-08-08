@@ -26,7 +26,7 @@ GRID_CONF = {
     'zbound': cfg['camera']['zbound'],
     'dbound': cfg['camera']['dbound'],
 }
-DATA_AUG_CONF = {'final_dim': (128, 352)}
+DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 
 X_MIN, X_MAX = -50.0, 50.0
 Y_MIN, Y_MAX = -50.0, 50.0

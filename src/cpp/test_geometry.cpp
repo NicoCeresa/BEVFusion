@@ -43,21 +43,26 @@ int main(int argc, char** argv) {
     const std::string data = (argc > 1) ? argv[1] : "data";
     int failures = 0;
 
+    const GeometryConfig g = load_grid_config(data + "/grid_config.txt");
+    std::printf("config: %d cams, %dx%d -> %dx%d, %d depth bins, %d ch; BEV %dx%dx%d\n",
+                g.n_cams, g.img_h, g.img_w, g.feat_h, g.feat_w, g.depth_bins, g.cam_c,
+                g.nx[0], g.nx[1], g.nx[2]);
+
     const std::vector<float> rots       = read_f32(data + "/rots.bin");
     const std::vector<float> trans      = read_f32(data + "/trans.bin");
     const std::vector<float> intrins    = read_f32(data + "/intrins.bin");
     const std::vector<float> post_rots  = read_f32(data + "/post_rots.bin");
     const std::vector<float> post_trans = read_f32(data + "/post_trans.bin");
 
-    const std::vector<float> frustum = create_frustum();
+    const std::vector<float> frustum = create_frustum(g);
     const std::vector<float> geom =
-        get_geometry(frustum, rots, trans, intrins, post_rots, post_trans);
+        get_geometry(g, frustum, rots, trans, intrins, post_rots, post_trans);
     failures += compare("get_geometry", geom, read_f32(data + "/ref_geometry.bin"), 1e-3f);
 
     // Feed the engine-layout camera features so pooling is tested on exactly
     // what cam_encode.engine will hand it.
     const std::vector<float> cam_raw = read_f32(data + "/ref_cam_encode_raw.bin");
-    const std::vector<float> pooled = voxel_pooling(geom, cam_raw);
+    const std::vector<float> pooled = voxel_pooling(g, geom, cam_raw);
     // Accumulation order differs from PyTorch's sorted cumsum, so float
     // rounding diverges slightly on cells with many contributions.
     failures += compare("voxel_pooling", pooled, read_f32(data + "/ref_voxel_pooled.bin"), 1e-2f);

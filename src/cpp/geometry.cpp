@@ -1,6 +1,8 @@
 #include "geometry.h"
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace {
 
@@ -56,18 +58,62 @@ std::vector<float> read_f32(const std::string& path) {
     return out;
 }
 
-std::vector<float> create_frustum() {
-    // ds  = arange(4.0, 45.0, 1.0), broadcast over (fH, fW)
-    // xs  = linspace(0, IMG_W - 1, fW), ys = linspace(0, IMG_H - 1, fH)
-    std::vector<float> frustum(DEPTH_BINS * FEAT_H * FEAT_W * 3);
+GeometryConfig load_grid_config(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error(
+        "Could not open " + path + " — run scripts/dump_grid_config.py first");
 
-    for (int d = 0; d < DEPTH_BINS; d++) {
-        const float depth = 4.0f + static_cast<float>(d);
-        for (int h = 0; h < FEAT_H; h++) {
-            const float v = 127.0f * static_cast<float>(h) / static_cast<float>(FEAT_H - 1);
-            for (int w = 0; w < FEAT_W; w++) {
-                const float u = 351.0f * static_cast<float>(w) / static_cast<float>(FEAT_W - 1);
-                const size_t base = ((static_cast<size_t>(d) * FEAT_H + h) * FEAT_W + w) * 3;
+    std::unordered_map<std::string, float> kv;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string key;
+        float value;
+        if (ss >> key >> value) kv[key] = value;
+    }
+
+    auto need = [&](const std::string& key) {
+        auto it = kv.find(key);
+        if (it == kv.end()) throw std::runtime_error("missing key '" + key + "' in " + path);
+        return it->second;
+    };
+
+    GeometryConfig g;
+    g.n_cams       = static_cast<int>(need("n_cams"));
+    g.cam_c        = static_cast<int>(need("cam_c"));
+    g.img_h        = static_cast<int>(need("img_h"));
+    g.img_w        = static_cast<int>(need("img_w"));
+    g.feat_h       = static_cast<int>(need("feat_h"));
+    g.feat_w       = static_cast<int>(need("feat_w"));
+    g.depth_bins   = static_cast<int>(need("depth_bins"));
+    g.dbound_start = need("dbound_start");
+    g.dbound_step  = need("dbound_step");
+    const char* axes[3] = {"x", "y", "z"};
+    for (int i = 0; i < 3; i++) {
+        g.dx[i] = need(std::string(axes[i]) + "_step");
+        // Cell centre, matching gen_dx_bx: bx = min + step/2.
+        g.bx[i] = need(std::string(axes[i]) + "_min") + g.dx[i] / 2.0f;
+        g.nx[i] = static_cast<int>(
+            (need(std::string(axes[i]) + "_max") - need(std::string(axes[i]) + "_min")) / g.dx[i]);
+    }
+    return g;
+}
+
+std::vector<float> create_frustum(const GeometryConfig& g) {
+    // ds = arange(dbound_start, ..., dbound_step), broadcast over (fH, fW)
+    // xs = linspace(0, img_w - 1, fW), ys = linspace(0, img_h - 1, fH)
+    std::vector<float> frustum(g.frustum_points() * 3);
+
+    for (int d = 0; d < g.depth_bins; d++) {
+        const float depth = g.dbound_start + g.dbound_step * static_cast<float>(d);
+        for (int h = 0; h < g.feat_h; h++) {
+            const float v = static_cast<float>(g.img_h - 1) * static_cast<float>(h)
+                          / static_cast<float>(g.feat_h - 1);
+            for (int w = 0; w < g.feat_w; w++) {
+                const float u = static_cast<float>(g.img_w - 1) * static_cast<float>(w)
+                              / static_cast<float>(g.feat_w - 1);
+                const size_t base = ((static_cast<size_t>(d) * g.feat_h + h) * g.feat_w + w) * 3;
                 frustum[base + 0] = u;
                 frustum[base + 1] = v;
                 frustum[base + 2] = depth;
@@ -77,24 +123,25 @@ std::vector<float> create_frustum() {
     return frustum;
 }
 
-std::vector<float> get_geometry(const std::vector<float>& frustum,
+std::vector<float> get_geometry(const GeometryConfig& g,
+                                const std::vector<float>& frustum,
                                 const std::vector<float>& rots,
                                 const std::vector<float>& trans,
                                 const std::vector<float>& intrins,
                                 const std::vector<float>& post_rots,
                                 const std::vector<float>& post_trans) {
-    std::vector<float> geom(static_cast<size_t>(N_CAMS_G) * DEPTH_BINS * FEAT_H * FEAT_W * 3);
+    std::vector<float> geom(static_cast<size_t>(g.n_cams) * g.frustum_points() * 3);
 
-    for (int n = 0; n < N_CAMS_G; n++) {
+    for (int n = 0; n < g.n_cams; n++) {
         float inv_post_rot[9], inv_intrin[9], combine[9];
         mat3_inverse(&post_rots[n * 9], inv_post_rot);
         mat3_inverse(&intrins[n * 9], inv_intrin);
         mat3_mul(&rots[n * 9], inv_intrin, combine);   // rots @ inverse(intrins)
 
-        for (int d = 0; d < DEPTH_BINS; d++) {
-            for (int h = 0; h < FEAT_H; h++) {
-                for (int w = 0; w < FEAT_W; w++) {
-                    const size_t fbase = ((static_cast<size_t>(d) * FEAT_H + h) * FEAT_W + w) * 3;
+        for (int d = 0; d < g.depth_bins; d++) {
+            for (int h = 0; h < g.feat_h; h++) {
+                for (int w = 0; w < g.feat_w; w++) {
+                    const size_t fbase = ((static_cast<size_t>(d) * g.feat_h + h) * g.feat_w + w) * 3;
 
                     // undo post-augmentation
                     float p[3] = {frustum[fbase + 0] - post_trans[n * 3 + 0],
@@ -110,8 +157,8 @@ std::vector<float> get_geometry(const std::vector<float>& frustum,
                     float ego[3];
                     mat3_vec3(combine, ray, ego);
 
-                    const size_t gbase =
-                        ((((static_cast<size_t>(n) * DEPTH_BINS + d) * FEAT_H + h) * FEAT_W) + w) * 3;
+                    const size_t gbase = (static_cast<size_t>(n) * g.frustum_points()
+                                          + (static_cast<size_t>(d) * g.feat_h + h) * g.feat_w + w) * 3;
                     geom[gbase + 0] = ego[0] + trans[n * 3 + 0];
                     geom[gbase + 1] = ego[1] + trans[n * 3 + 1];
                     geom[gbase + 2] = ego[2] + trans[n * 3 + 2];
@@ -122,32 +169,33 @@ std::vector<float> get_geometry(const std::vector<float>& frustum,
     return geom;
 }
 
-std::vector<float> voxel_pooling(const std::vector<float>& geom,
+std::vector<float> voxel_pooling(const GeometryConfig& g,
+                                 const std::vector<float>& geom,
                                  const std::vector<float>& cam_feats) {
-    std::vector<float> bev(static_cast<size_t>(CAM_C) * BEV_X * BEV_Y, 0.0f);
+    std::vector<float> bev(g.bev_cells(), 0.0f);
 
-    for (int n = 0; n < N_CAMS_G; n++) {
-        for (int d = 0; d < DEPTH_BINS; d++) {
-            for (int h = 0; h < FEAT_H; h++) {
-                for (int w = 0; w < FEAT_W; w++) {
-                    const size_t gbase =
-                        ((((static_cast<size_t>(n) * DEPTH_BINS + d) * FEAT_H + h) * FEAT_W) + w) * 3;
+    for (int n = 0; n < g.n_cams; n++) {
+        for (int d = 0; d < g.depth_bins; d++) {
+            for (int h = 0; h < g.feat_h; h++) {
+                for (int w = 0; w < g.feat_w; w++) {
+                    const size_t voxel = (static_cast<size_t>(d) * g.feat_h + h) * g.feat_w + w;
+                    const size_t gbase = (static_cast<size_t>(n) * g.frustum_points() + voxel) * 3;
 
                     // Truncation toward zero, matching PyTorch .long() — not
                     // floor. Differs for negatives, and the original LSS code
                     // relies on this, so keep the plain cast.
-                    const int ix = static_cast<int>((geom[gbase + 0] - (BX[0] - DX[0] / 2.0f)) / DX[0]);
-                    const int iy = static_cast<int>((geom[gbase + 1] - (BX[1] - DX[1] / 2.0f)) / DX[1]);
-                    const int iz = static_cast<int>((geom[gbase + 2] - (BX[2] - DX[2] / 2.0f)) / DX[2]);
+                    const int ix = static_cast<int>((geom[gbase + 0] - (g.bx[0] - g.dx[0] / 2.0f)) / g.dx[0]);
+                    const int iy = static_cast<int>((geom[gbase + 1] - (g.bx[1] - g.dx[1] / 2.0f)) / g.dx[1]);
+                    const int iz = static_cast<int>((geom[gbase + 2] - (g.bx[2] - g.dx[2] / 2.0f)) / g.dx[2]);
 
-                    if (ix < 0 || ix >= NX[0] || iy < 0 || iy >= NX[1] || iz < 0 || iz >= NX[2])
+                    if (ix < 0 || ix >= g.nx[0] || iy < 0 || iy >= g.nx[1] ||
+                        iz < 0 || iz >= g.nx[2])
                         continue;
 
                     // cam_feats is the engine's (N, C, D, fH, fW) layout.
-                    for (int c = 0; c < CAM_C; c++) {
-                        const size_t fidx =
-                            ((((static_cast<size_t>(n) * CAM_C + c) * DEPTH_BINS + d) * FEAT_H + h) * FEAT_W) + w;
-                        bev[(static_cast<size_t>(c) * BEV_X + ix) * BEV_Y + iy] += cam_feats[fidx];
+                    for (int c = 0; c < g.cam_c; c++) {
+                        const size_t fidx = (static_cast<size_t>(n) * g.cam_c + c) * g.frustum_points() + voxel;
+                        bev[(static_cast<size_t>(c) * g.nx[0] + ix) * g.nx[1] + iy] += cam_feats[fidx];
                     }
                 }
             }

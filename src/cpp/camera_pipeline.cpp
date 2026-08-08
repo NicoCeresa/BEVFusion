@@ -7,11 +7,10 @@
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "stb_image_resize2.h"
 
-std::vector<float> load_and_preprocess_images(const std::vector<std::string>& image_paths) {
-    if (image_paths.size() != N_CAMS)
-        throw std::runtime_error("Expected 6 camera images");
-
-    std::vector<float> out(N_CAMS * 3 * IMG_H * IMG_W);
+std::vector<float> load_and_preprocess_images(const std::vector<std::string>& image_paths,
+                                              int IMG_H, int IMG_W) {
+    const int N_CAMS = static_cast<int>(image_paths.size());
+    std::vector<float> out(static_cast<size_t>(N_CAMS) * 3 * IMG_H * IMG_W);
 
     for (int cam = 0; cam < N_CAMS; cam++) {
         int src_w, src_h, channels;
