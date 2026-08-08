@@ -14,11 +14,18 @@ def discretize_point_cloud(points: torch.Tensor, voxel_size: tuple, point_cloud_
 
     returns: (N, 2) pillar grid indices (ix, iy) per point
     """
-    (x_min, _), (y_min, _), _ = point_cloud_range
+    (x_min, x_max), (y_min, y_max), _ = point_cloud_range
     x_size, y_size, _ = voxel_size
+    grid_w = round((x_max - x_min) / x_size)
+    grid_h = round((y_max - y_min) / y_size)
 
-    ix = ((points[:, 0] - x_min) / x_size).floor().long()
-    iy = ((points[:, 1] - y_min) / y_size).floor().long()
+    # A point can pass the caller's `< x_max` range filter (in float32) yet
+    # still floor to exactly grid_w here, since the filter's comparison and
+    # this division/floor round differently right at the boundary. Rare, but
+    # with hundreds of thousands of points per sample (multi-sweep LiDAR) it
+    # does happen — clamp rather than let a downstream scatter go out of bounds.
+    ix = ((points[:, 0] - x_min) / x_size).floor().long().clamp(0, grid_w - 1)
+    iy = ((points[:, 1] - y_min) / y_size).floor().long().clamp(0, grid_h - 1)
 
     return torch.stack((ix, iy), dim=1)
 

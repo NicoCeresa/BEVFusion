@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from fusion.pipeline import BEVFusion
-from dataloader import NuScenesDataset
+from dataloader import NuScenesDataset, available_scene_names
 from train import EPOCHS, NUM_ANCHORS, generate_anchors
 import test as test_mod  # reuse decode_predictions/nms — must stay in sync with train.py's encoding
 
@@ -40,13 +40,35 @@ GRID_CONF = {
 }
 DATA_AUG_CONF = {'final_dim': (128, 352)}
 
-EVAL_SPLIT = 'mini_val'
 OUR_CLASSES = ['car', 'pedestrian', 'bicycle']
 
 # test.py's SCORE_THRESH (0.3) is tuned for a legible visualization, not for
 # eval — thresholding predictions before submission truncates the precision-
 # recall curve and understates AP. Relax it here; test.py's own file is untouched.
 test_mod.SCORE_THRESH = 0.05
+
+
+def resolve_eval_split(nusc):
+    """Picks the val scenes to evaluate on and registers them as a nuScenes
+    custom split (a `splits.json` next to the metadata — the devkit's own
+    supported mechanism), restricted to scenes actually present on disk.
+
+    A predefined split name (e.g. 'val') can't be used directly here: on a
+    partial dataset copy (a single trainval blob part, say), DetectionEval's
+    built-in loader would enumerate every officially-designated val scene
+    from the metadata regardless of whether its files exist, and then assert
+    that GT and prediction sample tokens match exactly — which fails the
+    moment any of those scenes are missing locally. Registering our own
+    intersected split sidesteps that.
+    """
+    split_key = 'mini_val' if nusc.version == 'v1.0-mini' else 'val'
+    scene_names = sorted(set(create_splits_scenes()[split_key]) & available_scene_names(nusc))
+
+    splits_path = Path(nusc.dataroot) / nusc.version / 'splits.json'
+    with open(splits_path, 'w') as f:
+        json.dump({'eval_available': scene_names}, f)
+
+    return 'eval_available', scene_names
 
 
 def fast_nms(boxes, scores):
@@ -72,11 +94,12 @@ def ego_to_global(box, ego_t, ego_r):
     return xyz, [float(w), float(l), float(h)], rot, vel
 
 
-def build_submission(model, dataset, nusc, anchors, device, sample_indices, max_boxes_per_sample):
+def build_submission(model, dataset, nusc, anchors, device, max_boxes_per_sample):
     results = {}
-    for idx in sample_indices:
+    for i in range(len(dataset)):
+        idx = dataset.sample_indices[i]  # dataset-local index -> nusc.sample index
         sample_token = nusc.sample[idx]['token']
-        sample = dataset[idx]
+        sample = dataset[i]
 
         images     = sample['images'].unsqueeze(0).to(device)
         rots       = sample['rots'].unsqueeze(0).to(device)
@@ -126,14 +149,15 @@ def build_submission(model, dataset, nusc, anchors, device, sample_indices, max_
     return results
 
 
-def evaluate():
+def evaluate(ckpt_path=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    ckpt_dir = ROOT / "checkpoints"
-    ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
-    ckpt_path = ckpts[-1]
+    if ckpt_path is None:
+        ckpt_dir = ROOT / "checkpoints"
+        ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
+        if not ckpts:
+            raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
+        ckpt_path = ckpts[-1]
     print(f"Checkpoint: {ckpt_path.name}")
 
     model = BEVFusion(
@@ -148,23 +172,17 @@ def evaluate():
     anchors = generate_anchors(device)
 
     nusc = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
+    EVAL_SPLIT, scene_names = resolve_eval_split(nusc)
+    dataset = NuScenesDataset(nusc, scene_names=set(scene_names))
+    print(f"Evaluating on {len(dataset)} samples from {len(scene_names)} val scenes")
 
-    split_scenes = set(create_splits_scenes()[EVAL_SPLIT])
-    sample_indices = [
-        i for i, s in enumerate(nusc.sample)
-        if nusc.get('scene', s['scene_token'])['name'] in split_scenes
-    ]
-    print(f"Evaluating on {len(sample_indices)} samples from '{EVAL_SPLIT}'")
-
-    dataset = NuScenesDataset(nusc)
     det_cfg = config_factory('detection_cvpr_2019')
 
-    results = build_submission(model, dataset, nusc, anchors, device,
-                               sample_indices, det_cfg.max_boxes_per_sample)
+    results = build_submission(model, dataset, nusc, anchors, device, det_cfg.max_boxes_per_sample)
 
     output_dir = ROOT / "eval_results"
     output_dir.mkdir(exist_ok=True)
-    result_path = output_dir / f"{EVAL_SPLIT}_predictions.json"
+    result_path = output_dir / f"{ckpt_path.stem}_predictions.json"
     with open(result_path, 'w') as f:
         json.dump({
             'meta': {
@@ -180,7 +198,7 @@ def evaluate():
     metrics, _ = nusc_eval.evaluate()
 
     print("\n" + "=" * 60)
-    print(f"Results — {ckpt_path.name} on {EVAL_SPLIT} ({len(sample_indices)} samples)")
+    print(f"Results — {ckpt_path.name} on {EVAL_SPLIT} ({len(dataset)} samples)")
     print("=" * 60)
 
     print("\nAP by class (averaged over dist thresholds 0.5/1/2/4m):")
@@ -206,4 +224,4 @@ def evaluate():
 
 
 if __name__ == "__main__":
-    evaluate()
+    evaluate(Path(sys.argv[1]) if len(sys.argv) > 1 else None)

@@ -4,7 +4,7 @@ import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from fusion.pipeline import BEVFusion
-from dataloader import NuScenesDataset, collate_fn, available_scene_names
+from dataloader import NuScenesDataset, collate_fn, available_scene_names, CLASS_MAP
 
 with open(ROOT / "config.yaml") as f:
     cfg = yaml.safe_load(f)
@@ -48,6 +48,16 @@ ANCHOR_Z       = -1.0
 
 POS_IOU_THRESH = 0.50
 NEG_IOU_THRESH = 0.35
+
+# car/pedestrian are close in annotation count (~51%/46% of train instances);
+# bicycle is the real outlier (~3%, ~17x rarer than car). CBGS below groups by
+# per-sample class *presence*, matching the original paper's method — but
+# bicycle turns out to be instance-sparse rather than frame-sparse here (the
+# same few bicycles stay in view across many consecutive frames, so ~37% of
+# samples contain one despite there being few distinct bicycle objects
+# overall), so CBGS's frame-level oversampling has little effect on it. This
+# weight is doing most of the actual correction instead.
+CLASS_WEIGHTS = torch.tensor([1.0, 1.0, 6.0])  # car, pedestrian, bicycle
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +213,7 @@ def compute_loss(pred_cls, pred_reg, gt_boxes_batch, gt_labels_batch, anchors):
         cls_pred = pred_cls[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES)
         reg_pred = pred_reg[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 9)
 
-        cls_loss_total += focal_loss(cls_pred, cls_targets)[loss_mask].sum()
+        cls_loss_total += (focal_loss(cls_pred, cls_targets) * CLASS_WEIGHTS.to(device))[loss_mask].sum()
 
         if pos_mask.any():
             reg_loss_total += F.smooth_l1_loss(
@@ -213,6 +223,41 @@ def compute_loss(pred_cls, pred_reg, gt_boxes_batch, gt_labels_batch, anchors):
 
     norm = max(num_pos, 1)
     return cls_loss_total / norm, reg_loss_total / norm
+
+
+# ---------------------------------------------------------------------------
+# CBGS-style class-balanced sampling
+# ---------------------------------------------------------------------------
+
+def compute_cbgs_weights(dataset, nusc, num_classes):
+    """Class-Balanced Grouping and Sampling (Zhu et al., 2019) — the scheme
+    CenterPoint/BEVFusion's own nuScenes configs use for class imbalance.
+    Each sample's repeat factor is driven by the rarest class it contains
+    (by per-sample presence, matching the original method), so frames with
+    a class present in a smaller fraction of samples get drawn more often.
+    On this dataset that ends up mattering little for bicycle specifically —
+    see the CLASS_WEIGHTS comment above — but is still a faithful
+    reproduction of the paper's approach. Returns per-sample weights for
+    WeightedRandomSampler, which achieves the same effect as literally
+    duplicating rare-class samples, without materializing a longer index list.
+    """
+    sample_classes = []
+    class_sample_count = [0] * num_classes
+    for i in range(len(dataset)):
+        sample = nusc.sample[dataset.sample_indices[i]]
+        present = {CLASS_MAP[nusc.get('sample_annotation', t)['category_name']]
+                   for t in sample['anns']
+                   if nusc.get('sample_annotation', t)['category_name'] in CLASS_MAP}
+        sample_classes.append(present)
+        for c in present:
+            class_sample_count[c] += 1
+
+    n = len(dataset)
+    frac = [count / n for count in class_sample_count]
+    target = 1.0 / num_classes
+    ratios = [target / f if f > 0 else 1.0 for f in frac]
+
+    return [max((ratios[c] for c in present), default=1.0) for present in sample_classes]
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +279,13 @@ def train():
     train_set = NuScenesDataset(nusc, scene_names=set(splits['train']) & available)
     val_set   = NuScenesDataset(nusc, scene_names=set(splits['val']) & available)
 
+    # CBGS oversampling on train only — val must stay representative of the
+    # true distribution for an honest read on generalization.
+    cbgs_weights = compute_cbgs_weights(train_set, nusc, NUM_CLASSES)
+    train_sampler = WeightedRandomSampler(cbgs_weights, num_samples=len(train_set), replacement=True)
+
     num_workers  = os.cpu_count()
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn)
+    train_loader = DataLoader(train_set, batch_size=1, sampler=train_sampler, num_workers=num_workers, collate_fn=collate_fn)
     val_loader   = DataLoader(val_set,   batch_size=1, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
     model = BEVFusion(

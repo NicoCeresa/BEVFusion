@@ -169,14 +169,15 @@ def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, gt_boxes, gt_l
     plt.close()
     return img
 
-def test():
+def test(ckpt_path=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    ckpt_dir = ROOT / "checkpoints"
-    ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
-    ckpt_path = ckpts[-1]
+    if ckpt_path is None:
+        ckpt_dir = ROOT / "checkpoints"
+        ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
+        if not ckpts:
+            raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
+        ckpt_path = ckpts[-1]
     print(f"Checkpoint: {ckpt_path.name}")
 
     model = BEVFusion(
@@ -238,7 +239,7 @@ def test():
         ))
 
 
-    gif_path = images_dir / f"test_results_{EPOCHS}_epochs.gif"
+    gif_path = images_dir / f"test_results_{ckpt_path.stem}.gif"
     frames[0].save(
         gif_path,
         save_all=True,
@@ -250,4 +251,4 @@ def test():
 
 
 if __name__ == "__main__":
-    test()
+    test(Path(sys.argv[1]) if len(sys.argv) > 1 else None)
