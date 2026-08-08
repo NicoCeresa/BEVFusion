@@ -258,4 +258,9 @@ def test(ckpt_path=None):
 
 
 if __name__ == "__main__":
+    # Optional second arg overrides SCORE_THRESH — at small training scales the
+    # model's confidence on held-out scenes stays well under the 0.3 default,
+    # so a lower threshold is needed to visualize what it actually predicts.
+    if len(sys.argv) > 2:
+        SCORE_THRESH = float(sys.argv[2])
     test(Path(sys.argv[1]) if len(sys.argv) > 1 else None)

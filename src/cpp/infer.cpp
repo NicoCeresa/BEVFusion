@@ -5,6 +5,7 @@
 #include "geometry.h"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -80,6 +81,8 @@ void build_engine(const char* modelFile, const char* outputFile) {
     if (g_strict_fp32) config->clearFlag(BuilderFlag::kTF32);
 
     IHostMemory* serializedModel = builder->buildSerializedNetwork(*network, *config);
+    if (serializedModel == nullptr)
+        throw std::runtime_error(std::string("engine build failed for ") + modelFile);
 
     delete parser;
     delete network;
@@ -90,10 +93,10 @@ void build_engine(const char* modelFile, const char* outputFile) {
     delete serializedModel;
 }
 
-void ensure_engine(const char* modelFile, const char* engineFile) {
+void ensure_engine(const char* modelFile, const char* engineFile, const std::string& engine_name = "") {
     if (!std::filesystem::exists(engineFile)) {
         std::cout << "Building " << engineFile << " (first run)" << std::endl;
-        build_engine(modelFile, engineFile);
+        build_engine(modelFile, engineFile, engine_name);
     }
 }
 
@@ -107,9 +110,12 @@ ICudaEngine* load_engine(const char* engineFile, IRuntime* runtime) {
 // Builds (on first use) and loads one sub-model. Precisions get separate
 // engine files so switching modes doesn't silently reuse the other's cache.
 ICudaEngine* prepare_engine(const std::string& name, IRuntime* runtime) {
+    const char* suffix = g_int8 ? ".int8.engine"
+                       : g_strict_fp32 ? ".fp32.engine"
+                       : ".engine";
     const std::string onnx   = "engines/" + name + ".onnx";
-    const std::string engine = "engines/" + name + (g_strict_fp32 ? ".fp32.engine" : ".engine");
-    ensure_engine(onnx.c_str(), engine.c_str());
+    const std::string engine = "engines/" + name + suffix;
+    ensure_engine(onnx.c_str(), engine.c_str(), name);
     return load_engine(engine.c_str(), runtime);
 }
 
@@ -292,12 +298,14 @@ int main(int argc, char** argv) {
         // Skips JPEG decode/resize and feeds PyTorch's exact preprocessed
         // images, so a parity run measures the wiring alone rather than
         // stb-vs-PIL decode differences.
-        if (arg == "--ref-images")      use_ref_images = true;
+        if (arg == "--ref-images")       use_ref_images = true;
         else if (arg == "--strict-fp32") g_strict_fp32 = true;
+        else if (arg == "--int8")        g_int8 = true;
         else                             data_dir = arg;
     }
     IRuntime* runtime = createInferRuntime(logger);
     if (g_strict_fp32) std::cout << "(TF32 disabled)" << std::endl;
+    if (g_int8)        std::cout << "(INT8 quantization enabled)" << std::endl;
 
     ICudaEngine* cam_encode      = prepare_engine("cam_encode", runtime);
     ICudaEngine* bev_encode      = prepare_engine("bev_encode", runtime);
@@ -362,14 +370,47 @@ int main(int argc, char** argv) {
               << ", reg " << pred_reg.size() << " floats" << std::endl;
 
     // Dumped so scripts/compare_cpp.py can diff every stage against PyTorch.
-    write_f32(data_dir + "/cpp_cam_input.bin", cam_input);
-    write_f32(data_dir + "/cpp_cam_encode_raw.bin", cam_feats);
-    write_f32(data_dir + "/cpp_voxel_pooled.bin", pooled);
-    write_f32(data_dir + "/cpp_camera_bev.bin", camera_bev);
-    write_f32(data_dir + "/cpp_lidar_bev.bin", lidar_bev);
-    write_f32(data_dir + "/cpp_fused_bev.bin", fused);
-    write_f32(data_dir + "/cpp_pred_cls.bin", pred_cls);
-    write_f32(data_dir + "/cpp_pred_reg.bin", pred_reg);
+    // INT8 writes to its own prefix so a quantized run doesn't clobber the
+    // FP32 outputs it's meant to be compared against.
+    const std::string p = data_dir + (g_int8 ? "/int8_" : "/cpp_");
+    write_f32(p + "cam_input.bin", cam_input);
+    write_f32(p + "cam_encode_raw.bin", cam_feats);
+    write_f32(p + "voxel_pooled.bin", pooled);
+    write_f32(p + "camera_bev.bin", camera_bev);
+    write_f32(p + "lidar_bev.bin", lidar_bev);
+    write_f32(p + "fused_bev.bin", fused);
+    write_f32(p + "pred_cls.bin", pred_cls);
+    write_f32(p + "pred_reg.bin", pred_reg);
+
+    // Engine-only timing (excludes preprocessing and the CPU-side pooling and
+    // scatter), since that's what quantization actually changes.
+    {
+        const int warmup = 3, iters = 20;
+        for (int i = 0; i < warmup; i++) {
+            infer(cam_encode, stream, {&cam_input});
+            infer(bev_encode, stream, {&pooled});
+            infer(pointnet, stream, {&pillars.features});
+            infer(pillar_backbone, stream, {&lidar_scattered});
+            infer(bev_encoder, stream, {&camera_bev, &lidar_bev});
+            infer(ssd, stream, {&fused});
+        }
+        cudaStreamSynchronize(stream);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; i++) {
+            infer(cam_encode, stream, {&cam_input});
+            infer(bev_encode, stream, {&pooled});
+            infer(pointnet, stream, {&pillars.features});
+            infer(pillar_backbone, stream, {&lidar_scattered});
+            infer(bev_encoder, stream, {&camera_bev, &lidar_bev});
+            infer(ssd, stream, {&fused});
+        }
+        cudaStreamSynchronize(stream);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count() / iters;
+        std::printf("\nengine chain: %.1f ms/frame over %d iters (%s)\n",
+                    ms, iters, g_int8 ? "INT8" : (g_strict_fp32 ? "FP32 strict" : "FP32/TF32"));
+    }
 
     std::vector<detection> dets = nms(decode(pred_cls, pred_reg));
     std::cout << "\n" << dets.size() << " detections above score " << SCORE_THRESH << std::endl;

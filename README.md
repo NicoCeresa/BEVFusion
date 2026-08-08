@@ -197,7 +197,9 @@ Camera and LiDAR BEV features concatenated and refined by the convolutional BEV 
 
 ### Detection Output
 
-10-sample inference loop using `checkpoints/bevfusion_epoch10.pt` (10 epochs on a partial nuScenes trainval split — see [Target performance](#target-performance) for why this checkpoint over the later ones). Background is colored by LiDAR point height (purple = ground, yellow = rooftop). Solid colored boxes are model predictions (blue = car, green = pedestrian, red = bicycle); dashed white boxes are ground truth annotations.
+10 consecutive frames from **held-out validation scenes** using `checkpoints/bevfusion_epoch10.pt` (see [Target performance](#target-performance) for why this checkpoint over the later ones). Background is colored by LiDAR point height (purple = ground, yellow = rooftop). Solid colored boxes are model predictions (blue = car, green = pedestrian, red = bicycle); dashed white boxes are ground truth annotations.
+
+Rendered at a **0.1 score threshold**, not the 0.3 used elsewhere: on unseen scenes this checkpoint's confidence peaks around 0.11–0.16, so at 0.3 it emits nothing at all. The gap is stark and worth reading honestly — roughly 0–11 low-confidence predictions against 32–37 ground-truth boxes per frame. That is what training on ~2,500 samples buys, and it matches the near-zero mAP in the table above rather than contradicting it.
 
 ![Detection Results](images/test_results_bevfusion_epoch10.gif)
 
