@@ -13,26 +13,18 @@ a misleadingly narrow view of the activation range.
 Usage: python scripts/dump_calibration.py [num_samples]
 """
 import sys
-import yaml
 import torch
 import numpy as np
 from pathlib import Path
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import create_splits_scenes
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion, load_checkpoint
-from dataloader import NuScenesDataset, available_scene_names
-from train import NUM_ANCHORS
+from dataloader import NuScenesDataset
+from common import cfg, build_model, split_scene_names
 
-with open(ROOT / "config.yaml") as f:
-    cfg = yaml.safe_load(f)
-
-GRID_CONF = {k: cfg['camera'][k] for k in ('xbound', 'ybound', 'zbound', 'dbound')}
-DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 CALIB_DIR = ROOT / "data" / "calib"
 
 MAX_PILLARS, MAX_PTS = 10000, 32
@@ -74,18 +66,13 @@ def main(num_samples=8):
     CALIB_DIR.mkdir(parents=True, exist_ok=True)
 
     nusc = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
-    split_key = 'mini_val' if nusc.version == 'v1.0-mini' else 'val'
-    scenes = set(create_splits_scenes()[split_key]) & available_scene_names(nusc)
-    dataset = NuScenesDataset(nusc, scene_names=scenes)
+    dataset = NuScenesDataset(nusc, scene_names=split_scene_names(nusc, 'val'))
 
     stride = max(1, len(dataset) // num_samples)
     indices = [i * stride for i in range(num_samples) if i * stride < len(dataset)]
     print(f"Calibrating on {len(indices)} samples strided across {len(dataset)} val samples")
 
-    model = BEVFusion(lss_weights=cfg['weights']['lss'], grid_conf=GRID_CONF,
-                      data_aug_conf=DATA_AUG_CONF, num_anchors=NUM_ANCHORS).to(device)
-    load_checkpoint(model, ROOT / "checkpoints" / "bevfusion_epoch10.pt", device)
-    model.eval()
+    model = build_model(device, ROOT / "checkpoints" / "bevfusion_epoch10.pt")
     cam = model.camera_encoder
 
     for n, idx in enumerate(indices):

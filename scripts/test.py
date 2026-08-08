@@ -164,23 +164,14 @@ def test(ckpt_path=None):
         ckpt_path = ckpts[-1]
     print(f"Checkpoint: {ckpt_path.name}")
 
-    model = BEVFusion(
-        lss_weights   = cfg['weights']['lss'],
-        grid_conf     = GRID_CONF,
-        data_aug_conf = DATA_AUG_CONF,
-        num_anchors   = NUM_ANCHORS,
-    ).to(device)
-    load_checkpoint(model, ckpt_path, device)
-    model.eval()
-
+    model = build_model(device, ckpt_path)
     anchors = generate_anchors(device)
 
     nusc = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
 
     # Render held-out val scenes — visualizing detections on scenes the model
     # trained on would overstate what it can actually do.
-    split_key = 'mini_val' if nusc.version == 'v1.0-mini' else 'val'
-    val_scenes = set(create_splits_scenes()[split_key]) & available_scene_names(nusc)
+    val_scenes = split_scene_names(nusc, 'val')
     dataset = NuScenesDataset(nusc, scene_names=val_scenes)
     print(f"Rendering from {len(val_scenes)} held-out val scenes ({len(dataset)} samples)")
 

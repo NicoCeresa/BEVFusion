@@ -12,7 +12,6 @@ Usage: python scripts/dump_sample.py [sample_index]
 """
 import sys
 import shutil
-import yaml
 import torch
 import numpy as np
 from pathlib import Path
@@ -22,20 +21,10 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion, load_checkpoint
 from dataloader import NuScenesDataset, CAMERAS
-from train import NUM_ANCHORS
+from common import cfg, build_model
 
-with open(ROOT / "config.yaml") as f:
-    cfg = yaml.safe_load(f)
 
-GRID_CONF = {
-    'xbound': cfg['camera']['xbound'],
-    'ybound': cfg['camera']['ybound'],
-    'zbound': cfg['camera']['zbound'],
-    'dbound': cfg['camera']['dbound'],
-}
-DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 DATA_DIR = ROOT / "data"
 
 
@@ -85,14 +74,7 @@ def main(sample_idx=0):
     write_f32(DATA_DIR / "post_trans.bin", sample['post_trans'].numpy())
 
     # ---- reference tensors, captured stage by stage from the PyTorch model ----
-    model = BEVFusion(
-        lss_weights   = cfg['weights']['lss'],
-        grid_conf     = GRID_CONF,
-        data_aug_conf = DATA_AUG_CONF,
-        num_anchors   = NUM_ANCHORS,
-    ).to(device)
-    load_checkpoint(model, ROOT / "checkpoints" / "bevfusion_epoch10.pt", device)
-    model.eval()
+    model = build_model(device, ROOT / "checkpoints" / "bevfusion_epoch10.pt")
 
     images     = sample['images'].unsqueeze(0).to(device)
     rots       = sample['rots'].unsqueeze(0).to(device)

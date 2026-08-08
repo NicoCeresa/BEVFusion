@@ -9,14 +9,12 @@ reasons unrelated to the detector.
 """
 import sys
 import json
-import yaml
 import torch
 import numpy as np
 from pathlib import Path
 from torchvision.ops import nms as tv_nms
 from pyquaternion import Quaternion
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.eval.detection.config import config_factory
 from nuscenes.eval.detection.evaluate import DetectionEval
 
@@ -24,21 +22,11 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fusion.pipeline import BEVFusion, load_checkpoint
-from dataloader import NuScenesDataset, available_scene_names
-from train import EPOCHS, NUM_ANCHORS, generate_anchors
 import test as test_mod  # reuse decode_predictions/nms — must stay in sync with train.py's encoding
+from dataloader import NuScenesDataset
+from common import cfg, NUM_ANCHORS, generate_anchors, build_model, split_scene_names
 
-with open(ROOT / "config.yaml") as f:
-    cfg = yaml.safe_load(f)
 
-GRID_CONF = {
-    'xbound': cfg['camera']['xbound'],
-    'ybound': cfg['camera']['ybound'],
-    'zbound': cfg['camera']['zbound'],
-    'dbound': cfg['camera']['dbound'],
-}
-DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
 
 OUR_CLASSES = ['car', 'pedestrian', 'bicycle']
 
@@ -160,14 +148,7 @@ def evaluate(ckpt_path=None):
         ckpt_path = ckpts[-1]
     print(f"Checkpoint: {ckpt_path.name}")
 
-    model = BEVFusion(
-        lss_weights   = cfg['weights']['lss'],
-        grid_conf     = GRID_CONF,
-        data_aug_conf = DATA_AUG_CONF,
-        num_anchors   = NUM_ANCHORS,
-    ).to(device)
-    load_checkpoint(model, ckpt_path, device)
-    model.eval()
+    model = build_model(device, ckpt_path)
 
     anchors = generate_anchors(device)
 

@@ -1,6 +1,5 @@
 import sys
 import argparse
-import yaml
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,23 +13,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from camera.lss import compile_model
 from lidar.point_pillars import PointPillars
-from fusion.pipeline import BEVFusion
 from dataloader import NuScenesDataset, CAMERAS
 
-with open(ROOT / "config.yaml") as f:
-    cfg = yaml.safe_load(f)
+from fusion.pipeline import LSS_DERIVED_KEYS
+from common import (cfg, GRID_CONF, DATA_AUG_CONF, X_MIN, X_MAX, Y_MIN, Y_MAX,
+                    BEV_H, BEV_W, build_model)
 
-GRID_CONF = {
-    'xbound': cfg['camera']['xbound'],
-    'ybound': cfg['camera']['ybound'],
-    'zbound': cfg['camera']['zbound'],
-    'dbound': cfg['camera']['dbound'],
-}
-DATA_AUG_CONF = {'final_dim': tuple(cfg['camera']['image_size'])}
-
-X_MIN, X_MAX = -50.0, 50.0
-Y_MIN, Y_MAX = -50.0, 50.0
-BEV_H, BEV_W = 200, 200
 Z_MIN, Z_MAX = -3.0, 5.0
 
 
@@ -104,7 +92,12 @@ def vis_lidar_input(points, images_dir):
 
 def vis_lss(cam_inputs, images_dir):
     model = compile_model(GRID_CONF, DATA_AUG_CONF, outC=1)
-    model.load_state_dict(torch.load(cfg["weights"]["lss"], map_location="cpu"))
+    # Skip LSS's derived constants — `frustum`'s shape follows the input
+    # resolution, so a strict load fails whenever camera.image_size differs
+    # from whatever the pretrained weights were saved at.
+    state = {k: v for k, v in torch.load(cfg["weights"]["lss"], map_location="cpu").items()
+             if k not in LSS_DERIVED_KEYS}
+    model.load_state_dict(state, strict=False)
     model.eval()
 
     with torch.no_grad():
@@ -127,12 +120,7 @@ def vis_point_pillars(points, images_dir):
 
 
 def vis_bevfusion(cam_inputs, points, images_dir):
-    model = BEVFusion(
-        lss_weights   = cfg["weights"]["lss"],
-        grid_conf     = GRID_CONF,
-        data_aug_conf = DATA_AUG_CONF,
-    )
-    model.eval()
+    model = build_model(torch.device('cpu'))
 
     with torch.no_grad():
         cls, reg = model(*cam_inputs, points)
