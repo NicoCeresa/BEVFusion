@@ -3,6 +3,12 @@ Export each BEVFusion sub-module to ONNX for TensorRT compilation.
 
 Pillarization and scatter remain in C++ preprocessing — only the neural
 network segments are exported here.
+
+Weights are loaded from a trained checkpoint and split by submodule prefix.
+Exporting freshly-constructed modules instead would silently produce engines
+full of random weights that run fine and detect nothing.
+
+Usage: python scripts/export_onnx.py [checkpoint.pt]
 """
 import sys
 import torch
@@ -32,6 +38,28 @@ MAX_PTS      = 32
 NUM_ANCHORS  = 5
 
 
+# Which checkpoint state_dict prefix feeds each exported sub-model.
+CHECKPOINT_PREFIXES = {
+    "cam_encode":      "camera_encoder.camencode",
+    "bev_encode":      "camera_encoder.bevencode",
+    "pointnet":        "lidar_encoder.pointnet",
+    "pillar_backbone": "lidar_encoder.backbone",
+    "bev_encoder":     "bev_encoder",
+    "ssd":             "head",
+}
+
+
+def load_submodule_weights(model, state_dict, prefix):
+    """Load the `prefix.*` slice of a full-model checkpoint into a standalone
+    submodule. strict=True on purpose — a silent mismatch here means exporting
+    an engine with random weights, which is exactly the failure being avoided."""
+    sub = {k[len(prefix) + 1:]: v for k, v in state_dict.items() if k.startswith(prefix + ".")}
+    if not sub:
+        raise KeyError(f"No checkpoint keys under prefix '{prefix}'")
+    model.load_state_dict(sub, strict=True)
+    return model
+
+
 def export_to_onnx(name, model, example_inputs):
     engines_dir = ROOT / "engines"
     engines_dir.mkdir(exist_ok=True)
@@ -43,6 +71,12 @@ def export_to_onnx(name, model, example_inputs):
 
 
 if __name__ == "__main__":
+    ckpt_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "checkpoints" / "bevfusion_epoch10.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    print(f"Checkpoint: {ckpt_path.name}")
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+
     models = {
         "cam_encode":      (CamEncode(D=D, C=C, downsample=16),
                             (torch.randn(N_CAMS, 3, IMG_H, IMG_W),)),
@@ -65,4 +99,5 @@ if __name__ == "__main__":
     }
 
     for name, (model, example_inputs) in models.items():
+        load_submodule_weights(model, state_dict, CHECKPOINT_PREFIXES[name])
         export_to_onnx(name, model, example_inputs)

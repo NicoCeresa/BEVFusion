@@ -2,14 +2,43 @@
 #include "NvOnnxParser.h"
 #include "lidar_pipeline.h"
 #include "camera_pipeline.h"
+#include "geometry.h"
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 using namespace nvinfer1;
 using namespace nvonnxparser;
+
+// Must match src/lidar/point_pillars.py's PointPillars config and the shapes
+// scripts/export_onnx.py exported the engines with.
+static const float VOXEL_X = 0.25f, VOXEL_Y = 0.25f, VOXEL_Z = 4.0f;
+static const int   PILLAR_GRID_W = 400, PILLAR_GRID_H = 400;
+static const int   MAX_PILLARS = 10000, MAX_PTS_PER_PILLAR = 32;
+static const int   PILLAR_C = 64;          // pointnet output channels
+static const int   LIDAR_BEV_C = 384;      // pillar_backbone output channels
+static const int   FUSED_C = 256;
+static const int   NUM_CLASSES = 3, NUM_ANCHORS = 5, REG_DIM = 9;
+
+static const float SCORE_THRESH = 0.3f;
+static const float NMS_IOU_THRESH = 0.3f;
+static const char* CLASS_NAMES[NUM_CLASSES] = {"car", "pedestrian", "bicycle"};
+
+// (class_idx, w, l, h, rotation) — mirrors ANCHORS in scripts/train.py.
+struct anchor_template { int cls; float w, l, h, rot; };
+static const anchor_template ANCHOR_TEMPLATES[NUM_ANCHORS] = {
+    {0, 4.73f, 2.08f, 1.77f, 0.0f},
+    {0, 4.73f, 2.08f, 1.77f, 1.5708f},
+    {1, 0.76f, 0.76f, 1.73f, 0.0f},
+    {2, 1.76f, 0.60f, 1.73f, 0.0f},
+    {2, 1.76f, 0.60f, 1.73f, 1.5708f},
+};
+static const float ANCHOR_Z = -1.0f;
 
 class Logger : public ILogger
 {
@@ -26,11 +55,17 @@ void save_engine(IHostMemory* serializedModel, const char* outputFile) {
                serializedModel->size());
 }
 
+// TensorRT enables TF32 by default on Ampere+, which keeps only 10 mantissa
+// bits and costs ~0.2-0.5% relative accuracy vs PyTorch FP32. Fine for
+// deployment, but clearing it is how you tell a real wiring bug apart from
+// ordinary precision drift when validating.
+static bool g_strict_fp32 = false;
+
 void build_engine(const char* modelFile, const char* outputFile) {
     IBuilder* builder = createInferBuilder(logger);
     INetworkDefinition* network = builder->createNetworkV2(0);
     IParser* parser = createParser(*network, logger);
-    
+
     parser -> parseFromFile(modelFile,
     static_cast<int32_t>(ILogger::Severity::kWARNING));
     for (int32_t i = 0; i < parser->getNbErrors(); ++i) {
@@ -42,20 +77,22 @@ void build_engine(const char* modelFile, const char* outputFile) {
     IBuilderConfig* config = builder->createBuilderConfig();
     config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, free_bytes * 0.8); //global vram
     config->setMemoryPoolLimit(MemoryPoolType::kTACTIC_SHARED_MEMORY, 48 << 10); //on-chip memory
-    
+    if (g_strict_fp32) config->clearFlag(BuilderFlag::kTF32);
+
     IHostMemory* serializedModel = builder->buildSerializedNetwork(*network, *config);
 
     delete parser;
     delete network;
     delete config;
     delete builder;
-    
+
     save_engine(serializedModel, outputFile);
     delete serializedModel;
 }
 
 void ensure_engine(const char* modelFile, const char* engineFile) {
     if (!std::filesystem::exists(engineFile)) {
+        std::cout << "Building " << engineFile << " (first run)" << std::endl;
         build_engine(modelFile, engineFile);
     }
 }
@@ -67,89 +104,281 @@ ICudaEngine* load_engine(const char* engineFile, IRuntime* runtime) {
     return runtime->deserializeCudaEngine(buffer.data(), buffer.size());
 }
 
-std::vector<float> infer(ICudaEngine* engine, cudaStream_t stream, std::vector<float> const& host_input, Dims const& input_dims){
-
-    IExecutionContext *context = engine->createExecutionContext();
-
-    char const* const input_name = engine->getIOTensorName(0);
-    char const* const output_name = engine->getIOTensorName(1);
-
-    context->setInputShape(input_name, input_dims);
-    Dims const outputDims = context->getTensorShape(output_name);
-    size_t outputCount = 1;
-    for (int32_t i = 0; i < outputDims.nbDims; ++i)
-    {
-        outputCount *= outputDims.d[i];
-    }
-    std::vector<float> host_output(outputCount);
-
-    void* dInput{nullptr};
-    void* dOutput{nullptr};
-
-    cudaMalloc(&dInput, host_input.size() * sizeof(float));
-    cudaMalloc(&dOutput, host_output.size() * sizeof(float));
-    cudaMemcpyAsync(dInput, host_input.data(), host_input.size() * sizeof(float),
-        cudaMemcpyHostToDevice, stream);
-
-    context->setTensorAddress(input_name, dInput);
-    context->setTensorAddress(output_name, dOutput);
-    if (!context->enqueueV3(stream)) {
-        cudaFree(dInput);
-        cudaFree(dOutput);
-        cudaStreamDestroy(stream);
-        delete context;
-        throw std::runtime_error("enqueueV3 failed");
-    }
-
-
-    cudaMemcpyAsync(host_output.data(), dOutput,
-        host_output.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    cudaFree(dInput);
-    cudaFree(dOutput);
-    cudaStreamDestroy(stream);
-    delete context;
-
-    return host_output;
+// Builds (on first use) and loads one sub-model. Precisions get separate
+// engine files so switching modes doesn't silently reuse the other's cache.
+ICudaEngine* prepare_engine(const std::string& name, IRuntime* runtime) {
+    const std::string onnx   = "engines/" + name + ".onnx";
+    const std::string engine = "engines/" + name + (g_strict_fp32 ? ".fp32.engine" : ".engine");
+    ensure_engine(onnx.c_str(), engine.c_str());
+    return load_engine(engine.c_str(), runtime);
 }
 
+// Runs an engine with any number of inputs/outputs — bev_encoder takes two
+// inputs and ssd produces two outputs, so a single-in/single-out helper
+// doesn't cover the pipeline. Inputs are bound in declaration order.
+std::vector<std::vector<float>> infer(ICudaEngine* engine, cudaStream_t stream,
+                                      const std::vector<const std::vector<float>*>& inputs) {
+    IExecutionContext* context = engine->createExecutionContext();
 
-int main() {
+    std::vector<std::string> input_names, output_names;
+    for (int32_t i = 0; i < engine->getNbIOTensors(); i++) {
+        const char* name = engine->getIOTensorName(i);
+        if (engine->getTensorIOMode(name) == TensorIOMode::kINPUT) input_names.push_back(name);
+        else                                                        output_names.push_back(name);
+    }
+    if (input_names.size() != inputs.size())
+        throw std::runtime_error("engine expects a different number of inputs");
+
+    std::vector<void*> device_buffers;
+    auto cleanup = [&]() {
+        for (void* p : device_buffers) cudaFree(p);
+        delete context;
+    };
+
+    try {
+        for (size_t i = 0; i < input_names.size(); i++) {
+            const std::vector<float>& host = *inputs[i];
+            void* dev = nullptr;
+            cudaMalloc(&dev, host.size() * sizeof(float));
+            device_buffers.push_back(dev);
+            cudaMemcpyAsync(dev, host.data(), host.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, stream);
+            context->setTensorAddress(input_names[i].c_str(), dev);
+        }
+
+        std::vector<std::vector<float>> outputs;
+        std::vector<void*> output_devs;
+        for (const std::string& name : output_names) {
+            const Dims dims = context->getTensorShape(name.c_str());
+            size_t count = 1;
+            for (int32_t d = 0; d < dims.nbDims; d++) count *= dims.d[d];
+
+            void* dev = nullptr;
+            cudaMalloc(&dev, count * sizeof(float));
+            device_buffers.push_back(dev);
+            output_devs.push_back(dev);
+            context->setTensorAddress(name.c_str(), dev);
+            outputs.emplace_back(count);
+        }
+
+        if (!context->enqueueV3(stream)) throw std::runtime_error("enqueueV3 failed");
+
+        for (size_t i = 0; i < outputs.size(); i++)
+            cudaMemcpyAsync(outputs[i].data(), output_devs[i],
+                            outputs[i].size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+
+        cleanup();
+        return outputs;
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+}
+
+// Scatters per-pillar features into the dense BEV grid — the C++ counterpart
+// of PointPillars._scatter. Output is (C, grid_h, grid_w).
+std::vector<float> scatter_pillars(const std::vector<float>& pillar_features,
+                                   const std::vector<pillar_index>& indices,
+                                   int num_pillars) {
+    std::vector<float> bev(static_cast<size_t>(PILLAR_C) * PILLAR_GRID_H * PILLAR_GRID_W, 0.0f);
+    const int P = std::min(num_pillars, MAX_PILLARS);
+
+    for (int p = 0; p < P; p++) {
+        const int ix = indices[p].ix, iy = indices[p].iy;
+        if (ix < 0 || ix >= PILLAR_GRID_W || iy < 0 || iy >= PILLAR_GRID_H) continue;
+        for (int c = 0; c < PILLAR_C; c++)
+            bev[(static_cast<size_t>(c) * PILLAR_GRID_H + iy) * PILLAR_GRID_W + ix] =
+                pillar_features[static_cast<size_t>(p) * PILLAR_C + c];
+    }
+    return bev;
+}
+
+struct detection {
+    float x, y, z, w, l, h, theta, vx, vy;
+    float score;
+    int   cls;
+};
+
+// Inverse of encode_reg in scripts/train.py; mirrors decode_predictions in
+// scripts/test.py.
+std::vector<detection> decode(const std::vector<float>& pred_cls,
+                              const std::vector<float>& pred_reg) {
+    std::vector<detection> dets;
+
+    for (int h = 0; h < BEV_Y; h++) {
+        for (int w = 0; w < BEV_X; w++) {
+            // Anchor grid centres, matching generate_anchors in train.py.
+            const float ax_center = -50.0f + static_cast<float>(w) * 0.5f + 0.25f;
+            const float ay_center = -50.0f + static_cast<float>(h) * 0.5f + 0.25f;
+
+            for (int a = 0; a < NUM_ANCHORS; a++) {
+                const anchor_template& t = ANCHOR_TEMPLATES[a];
+
+                int best_cls = 0;
+                float best_score = -1.0f;
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    const size_t idx =
+                        (static_cast<size_t>(a * NUM_CLASSES + c) * BEV_Y + h) * BEV_X + w;
+                    const float score = 1.0f / (1.0f + std::exp(-pred_cls[idx]));
+                    if (score > best_score) { best_score = score; best_cls = c; }
+                }
+                if (best_score <= SCORE_THRESH) continue;
+
+                float r[REG_DIM];
+                for (int k = 0; k < REG_DIM; k++)
+                    r[k] = pred_reg[(static_cast<size_t>(a * REG_DIM + k) * BEV_Y + h) * BEV_X + w];
+
+                const float diag = std::sqrt(t.w * t.w + t.l * t.l);
+                detection d;
+                d.x     = ax_center + r[0] * diag;
+                d.y     = ay_center + r[1] * diag;
+                d.z     = ANCHOR_Z + r[2] * t.h;
+                d.w     = t.w * std::exp(r[3]);
+                d.l     = t.l * std::exp(r[4]);
+                d.h     = t.h * std::exp(r[5]);
+                d.theta = t.rot + std::asin(std::max(-1.0f, std::min(1.0f, r[6])));
+                d.vx    = r[7];
+                d.vy    = r[8];
+                d.score = best_score;
+                d.cls   = best_cls;
+                dets.push_back(d);
+            }
+        }
+    }
+    return dets;
+}
+
+// Greedy NMS on axis-aligned BEV boxes, matching scripts/test.py's nms().
+std::vector<detection> nms(std::vector<detection> dets) {
+    std::sort(dets.begin(), dets.end(),
+              [](const detection& a, const detection& b) { return a.score > b.score; });
+
+    std::vector<detection> kept;
+    std::vector<bool> suppressed(dets.size(), false);
+
+    for (size_t i = 0; i < dets.size(); i++) {
+        if (suppressed[i]) continue;
+        kept.push_back(dets[i]);
+
+        const float ax1 = dets[i].x - dets[i].w / 2, ax2 = dets[i].x + dets[i].w / 2;
+        const float ay1 = dets[i].y - dets[i].l / 2, ay2 = dets[i].y + dets[i].l / 2;
+
+        for (size_t j = i + 1; j < dets.size(); j++) {
+            if (suppressed[j]) continue;
+            const float bx1 = dets[j].x - dets[j].w / 2, bx2 = dets[j].x + dets[j].w / 2;
+            const float by1 = dets[j].y - dets[j].l / 2, by2 = dets[j].y + dets[j].l / 2;
+
+            const float iw = std::max(0.0f, std::min(ax2, bx2) - std::max(ax1, bx1));
+            const float ih = std::max(0.0f, std::min(ay2, by2) - std::max(ay1, by1));
+            const float inter = iw * ih;
+            const float uni = dets[i].w * dets[i].l + dets[j].w * dets[j].l - inter;
+            if (inter / (uni + 1e-6f) >= NMS_IOU_THRESH) suppressed[j] = true;
+        }
+    }
+    return kept;
+}
+
+void write_f32(const std::string& path, const std::vector<float>& data) {
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
+}
+
+int main(int argc, char** argv) {
+    std::string data_dir = "data";
+    bool use_ref_images = false;
+    for (int i = 1; i < argc; i++) {
+        const std::string arg = argv[i];
+        // Skips JPEG decode/resize and feeds PyTorch's exact preprocessed
+        // images, so a parity run measures the wiring alone rather than
+        // stb-vs-PIL decode differences.
+        if (arg == "--ref-images")      use_ref_images = true;
+        else if (arg == "--strict-fp32") g_strict_fp32 = true;
+        else                             data_dir = arg;
+    }
     IRuntime* runtime = createInferRuntime(logger);
+    if (g_strict_fp32) std::cout << "(TF32 disabled)" << std::endl;
 
-    ensure_engine("engines/cam_encode.onnx", "engines/cam_encode.engine");
-    ensure_engine("engines/bev_encode.onnx", "engines/bev_encode.engine");
-    ensure_engine("engines/pointnet.onnx", "engines/pointnet.engine");
-    ensure_engine("engines/pillar_backbone.onnx", "engines/pillar_backbone.engine");
-    ensure_engine("engines/bev_encoder.onnx", "engines/bev_encoder.engine");
-    ensure_engine("engines/ssd.onnx", "engines/ssd.engine");
-
-    ICudaEngine* cam_encode      = load_engine("engines/cam_encode.engine", runtime);
-    ICudaEngine* bev_encode      = load_engine("engines/bev_encode.engine", runtime);
-    ICudaEngine* pointnet        = load_engine("engines/pointnet.engine", runtime);
-    ICudaEngine* pillar_backbone = load_engine("engines/pillar_backbone.engine", runtime);
-    ICudaEngine* bev_encoder     = load_engine("engines/bev_encoder.engine", runtime);
-    ICudaEngine* ssd             = load_engine("engines/ssd.engine", runtime);
+    ICudaEngine* cam_encode      = prepare_engine("cam_encode", runtime);
+    ICudaEngine* bev_encode      = prepare_engine("bev_encode", runtime);
+    ICudaEngine* pointnet        = prepare_engine("pointnet", runtime);
+    ICudaEngine* pillar_backbone = prepare_engine("pillar_backbone", runtime);
+    ICudaEngine* bev_encoder     = prepare_engine("bev_encoder", runtime);
+    ICudaEngine* ssd             = prepare_engine("ssd", runtime);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
-    // camera branch
+    // ---- camera branch: images -> lifted features -> BEV -> bev_encode ----
     std::vector<std::string> image_paths = {
-        "data/CAM_FRONT.jpg", "data/CAM_FRONT_LEFT.jpg", "data/CAM_FRONT_RIGHT.jpg",
-        "data/CAM_BACK.jpg",  "data/CAM_BACK_LEFT.jpg",  "data/CAM_BACK_RIGHT.jpg"
+        data_dir + "/CAM_FRONT.jpg",      data_dir + "/CAM_FRONT_RIGHT.jpg",
+        data_dir + "/CAM_FRONT_LEFT.jpg", data_dir + "/CAM_BACK.jpg",
+        data_dir + "/CAM_BACK_LEFT.jpg",  data_dir + "/CAM_BACK_RIGHT.jpg"
     };
-    std::vector<float> cam_input = load_and_preprocess_images(image_paths);
-    Dims4 cam_dims{6, 3, IMG_H, IMG_W};
-    std::vector<float> cam_output = infer(cam_encode, stream, cam_input, cam_dims);
+    std::vector<float> cam_input = use_ref_images
+        ? read_f32(data_dir + "/ref_images.bin")
+        : load_and_preprocess_images(image_paths);
+    if (use_ref_images) std::cout << "(using PyTorch reference images)" << std::endl;
+    std::vector<float> cam_feats = infer(cam_encode, stream, {&cam_input})[0];
+    std::cout << "cam_encode      -> " << cam_feats.size() << " floats" << std::endl;
 
-    // lidar branch
-    voxel_size vs{0.2f, 0.2f, 0.4f};
-    point_cloud_range range{-50.f, 50.f, -50.f, 50.f, -3.f, 5.f};
-    std::vector<float> pillar_input = run_lidar_pipeline("data/LIDAR_TOP.bin", vs, range, 32);
-    Dims3 pointnet_dims{10000, 32, 9};
-    std::vector<float> pointnet_output = infer(pointnet, stream, pillar_input, pointnet_dims);
+    const std::vector<float> frustum = create_frustum();
+    const std::vector<float> geom = get_geometry(frustum,
+                                                 read_f32(data_dir + "/rots.bin"),
+                                                 read_f32(data_dir + "/trans.bin"),
+                                                 read_f32(data_dir + "/intrins.bin"),
+                                                 read_f32(data_dir + "/post_rots.bin"),
+                                                 read_f32(data_dir + "/post_trans.bin"));
+    std::vector<float> pooled = voxel_pooling(geom, cam_feats);
+    std::cout << "voxel_pooling   -> " << pooled.size() << " floats" << std::endl;
+
+    std::vector<float> camera_bev = infer(bev_encode, stream, {&pooled})[0];
+    std::cout << "bev_encode      -> " << camera_bev.size() << " floats" << std::endl;
+
+    // ---- lidar branch: points -> pillars -> pointnet -> scatter -> backbone ----
+    voxel_size vs{VOXEL_X, VOXEL_Y, VOXEL_Z};
+    point_cloud_range range{-50.f, 50.f, -50.f, 50.f, -5.f, 3.f};
+    lidar_pillars pillars = run_lidar_pipeline(data_dir + "/LIDAR_TOP.bin", vs, range,
+                                               MAX_PTS_PER_PILLAR, MAX_PILLARS);
+    std::cout << "pillarize       -> " << pillars.num_pillars << " pillars";
+    if (pillars.num_pillars > MAX_PILLARS)
+        std::cout << " (truncated to " << MAX_PILLARS << ")";
+    std::cout << std::endl;
+
+    std::vector<float> pillar_feats = infer(pointnet, stream, {&pillars.features})[0];
+    std::vector<float> lidar_scattered = scatter_pillars(pillar_feats, pillars.indices,
+                                                         pillars.num_pillars);
+    std::vector<float> lidar_bev = infer(pillar_backbone, stream, {&lidar_scattered})[0];
+    std::cout << "pillar_backbone -> " << lidar_bev.size() << " floats" << std::endl;
+
+    // ---- fusion + detection head ----
+    std::vector<float> fused = infer(bev_encoder, stream, {&camera_bev, &lidar_bev})[0];
+    std::cout << "bev_encoder     -> " << fused.size() << " floats" << std::endl;
+
+    std::vector<std::vector<float>> head_out = infer(ssd, stream, {&fused});
+    const std::vector<float>& pred_cls = head_out[0];
+    const std::vector<float>& pred_reg = head_out[1];
+    std::cout << "ssd             -> cls " << pred_cls.size()
+              << ", reg " << pred_reg.size() << " floats" << std::endl;
+
+    // Dumped so scripts/compare_cpp.py can diff every stage against PyTorch.
+    write_f32(data_dir + "/cpp_cam_input.bin", cam_input);
+    write_f32(data_dir + "/cpp_cam_encode_raw.bin", cam_feats);
+    write_f32(data_dir + "/cpp_voxel_pooled.bin", pooled);
+    write_f32(data_dir + "/cpp_camera_bev.bin", camera_bev);
+    write_f32(data_dir + "/cpp_lidar_bev.bin", lidar_bev);
+    write_f32(data_dir + "/cpp_fused_bev.bin", fused);
+    write_f32(data_dir + "/cpp_pred_cls.bin", pred_cls);
+    write_f32(data_dir + "/cpp_pred_reg.bin", pred_reg);
+
+    std::vector<detection> dets = nms(decode(pred_cls, pred_reg));
+    std::cout << "\n" << dets.size() << " detections above score " << SCORE_THRESH << std::endl;
+    for (size_t i = 0; i < dets.size() && i < 20; i++) {
+        const detection& d = dets[i];
+        std::printf("  %-11s score=%.3f  xyz=(%7.2f,%7.2f,%6.2f)  wlh=(%.2f,%.2f,%.2f)  yaw=%6.3f  v=(%.2f,%.2f)\n",
+                    CLASS_NAMES[d.cls], d.score, d.x, d.y, d.z, d.w, d.l, d.h, d.theta, d.vx, d.vy);
+    }
 
     cudaStreamDestroy(stream);
+    return 0;
 }

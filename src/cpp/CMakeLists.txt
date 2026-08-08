@@ -3,7 +3,7 @@ project(bevfusion_infer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(infer infer.cpp pillarize.cpp lidar_pipeline.cpp camera_pipeline.cpp)
+add_executable(infer infer.cpp pillarize.cpp lidar_pipeline.cpp camera_pipeline.cpp geometry.cpp)
 
 target_include_directories(infer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -15,3 +15,7 @@ target_link_libraries(infer PRIVATE
     /mnt/BC42E05D42E01E40/TensorRT-11.0.0.114/lib/libnvonnxparser.so
     /usr/lib/x86_64-linux-gnu/libcudart.so
 )
+
+# Geometry/pooling parity check against PyTorch — no TensorRT needed.
+add_executable(test_geometry test_geometry.cpp geometry.cpp)
+target_include_directories(test_geometry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

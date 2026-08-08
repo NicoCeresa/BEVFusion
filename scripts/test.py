@@ -8,13 +8,14 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from pathlib import Path
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.splits import create_splits_scenes
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from fusion.pipeline import BEVFusion
-from dataloader import NuScenesDataset
+from dataloader import NuScenesDataset, available_scene_names
 from train import EPOCHS, NUM_ANCHORS, generate_anchors
 from visualize import lidar_height_rgb
 
@@ -191,8 +192,14 @@ def test(ckpt_path=None):
 
     anchors = generate_anchors(device)
 
-    nusc    = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
-    dataset = NuScenesDataset(nusc)
+    nusc = NuScenes(version=cfg['data']['version'], dataroot=cfg['data']['root'], verbose=False)
+
+    # Render held-out val scenes — visualizing detections on scenes the model
+    # trained on would overstate what it can actually do.
+    split_key = 'mini_val' if nusc.version == 'v1.0-mini' else 'val'
+    val_scenes = set(create_splits_scenes()[split_key]) & available_scene_names(nusc)
+    dataset = NuScenesDataset(nusc, scene_names=val_scenes)
+    print(f"Rendering from {len(val_scenes)} held-out val scenes ({len(dataset)} samples)")
 
     images_dir = ROOT / "images"
     images_dir.mkdir(exist_ok=True)

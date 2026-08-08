@@ -32,6 +32,14 @@ X_MIN, X_MAX  = -50.0, 50.0
 Y_MIN, Y_MAX  = -50.0, 50.0
 NUM_CLASSES   = 3
 EPOCHS = 15
+# Epochs of no val-loss improvement before stopping; None disables.
+# Off by default: on the 15-epoch trainval01 run, val loss was a poor proxy for
+# detection quality — it bottomed at epoch 1 (total) / epoch 4 (cls), while of
+# the checkpoints actually scored with eval.py, epoch 10 beat epoch 15
+# (partial NDS 0.0517 vs 0.0278). Patience=5 would have stopped at epoch 6 and
+# never produced that checkpoint. Enable only if you've confirmed val loss
+# tracks mAP on your data.
+EARLY_STOP_PATIENCE = None
 
 # Per-class anchors: (class_idx, w, l, h, rotation_rad)
 # Each class gets anchors sized to match its typical object dimensions.
@@ -302,7 +310,9 @@ def train():
     ckpt_dir = ROOT / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
 
-    
+    best_val = float('inf')
+    best_epoch = -1
+    epochs_since_improvement = 0
 
     for epoch in tqdm(range(EPOCHS), desc="Epochs"):
         model.train()
@@ -357,13 +367,30 @@ def train():
                 v_reg += reg_loss.item()
 
         m = len(val_loader)
-        print(f"  |  val cls {v_cls/m:.4f}  reg {v_reg/m:.4f}")
+        val_total = v_cls / m + v_reg / m
+        print(f"  |  val cls {v_cls/m:.4f}  reg {v_reg/m:.4f}  total {val_total:.4f}", end="")
+
+        # Overfitting sets in well before the final epoch on this dataset, so
+        # the last checkpoint is not the one you want — track the best.
+        if val_total < best_val:
+            best_val, best_epoch, epochs_since_improvement = val_total, epoch, 0
+            torch.save(model.state_dict(), ckpt_dir / "bevfusion_best.pt")
+            print("  * best")
+        else:
+            epochs_since_improvement += 1
+            print("")
 
         if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), ckpt_dir / f"bevfusion_epoch{epoch+1}.pt")
 
+        if EARLY_STOP_PATIENCE and epochs_since_improvement >= EARLY_STOP_PATIENCE:
+            print(f"Early stop: no val improvement for {EARLY_STOP_PATIENCE} epochs")
+            break
+
     torch.save(model.state_dict(), ckpt_dir / f"bevfusion_{EPOCHS}_epochs.pt")
     print(f"Saved final checkpoint → {ckpt_dir}")
+    print(f"Best val loss {best_val:.4f} at epoch {best_epoch} → bevfusion_best.pt")
+    print("Note: val loss is a proxy — confirm the pick with scripts/eval.py before shipping one.")
 
 
 if __name__ == "__main__":

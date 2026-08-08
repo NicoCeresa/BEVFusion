@@ -52,10 +52,11 @@ std::vector<cluster_center> get_cluster_centers(const std::vector<point>& points
     return centers;
 }
 
-std::vector<float> flatten_pillars(const pillar_batch& batch, int max_points_per_pillar) {
+std::vector<float> flatten_pillars(const pillar_batch& batch, int max_points_per_pillar, int max_pillars) {
     const int POINT_DIM = 9;
     int P = static_cast<int>(batch.features.size());
-    std::vector<float> out(P * max_points_per_pillar * POINT_DIM, 0.0f);
+    if (P > max_pillars) P = max_pillars;   // engine input shape is fixed
+    std::vector<float> out(static_cast<size_t>(max_pillars) * max_points_per_pillar * POINT_DIM, 0.0f);
 
     for (int p = 0; p < P; p++) {
         const auto& pillar = batch.features[p];
@@ -76,15 +77,33 @@ std::vector<float> flatten_pillars(const pillar_batch& batch, int max_points_per
     return out;
 }
 
-std::vector<float> run_lidar_pipeline(const std::string& bin_path,
-                                       voxel_size vs,
-                                       point_cloud_range range,
-                                       int max_points_per_pillar) {
+lidar_pillars run_lidar_pipeline(const std::string& bin_path,
+                                  voxel_size vs,
+                                  point_cloud_range range,
+                                  int max_points_per_pillar,
+                                  int max_pillars) {
     std::vector<point> points = load_bin(bin_path);
-    std::vector<pillar_index> indices = discretize_point_clouds(points, vs, range);
+
+    // The Python side filters to the point cloud range before pillarizing;
+    // without this, out-of-range points land in out-of-bounds grid cells.
+    std::vector<point> in_range;
+    in_range.reserve(points.size());
+    for (const point& p : points) {
+        if (p.x >= range.x_min && p.x < range.x_max &&
+            p.y >= range.y_min && p.y < range.y_max &&
+            p.z >= range.z_min && p.z < range.z_max)
+            in_range.push_back(p);
+    }
+
+    std::vector<pillar_index> indices = discretize_point_clouds(in_range, vs, range);
     std::vector<pillar_center> centers = get_pillar_centers(indices, vs, range);
-    std::vector<cluster_center> clusters = get_cluster_centers(points, indices);
-    std::vector<augmented_point> augmented = augment_pillars(points, centers, clusters);
+    std::vector<cluster_center> clusters = get_cluster_centers(in_range, indices);
+    std::vector<augmented_point> augmented = augment_pillars(in_range, centers, clusters);
     pillar_batch batch = optimize_pillars(augmented, indices, max_points_per_pillar);
-    return flatten_pillars(batch, max_points_per_pillar);
+
+    lidar_pillars out;
+    out.features    = flatten_pillars(batch, max_points_per_pillar, max_pillars);
+    out.indices     = batch.unique_indices;
+    out.num_pillars = static_cast<int>(batch.unique_indices.size());
+    return out;
 }

@@ -23,11 +23,12 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 | 3 | LiDAR encoder: PointPillars | ✅ Done |
 | 4 | BEV fusion encoder + detection head | ✅ Done |
 | 5 | Data loader + loss function + training | ✅ Done |
-| 6 | C++ TensorRT inference engine | 🟡 Partial — all 6 sub-models export to ONNX and build to TensorRT `.engine` files; full 6-model pipeline wiring in `infer.cpp` (camera → bev_encode, lidar → pillar_backbone, fusion → ssd) is not yet connected end-to-end |
+| 6 | C++ TensorRT inference engine | ✅ Done — all 6 sub-models chained end-to-end, validated against PyTorch stage by stage (see [C++ engine parity](#c-engine-parity)) |
 
 ### Next Steps:
-- Wire the full 6-model inference pipeline together in `infer.cpp` and validate against a real sample end-to-end
 - INT8 quantization of the TensorRT engines, with accuracy benchmarking against FP32
+- Multi-sweep LiDAR aggregation in C++ — the engine currently consumes a pre-aggregated point cloud dumped from Python (see [C++ engine parity](#c-engine-parity))
+- Automatic best-checkpoint selection in `train.py` based on validation metrics, rather than picking one manually with `eval.py` afterwards
 - Pull additional nuScenes trainval blob parts (currently training on 1 of ~10, 85 of 850 scenes) for a larger, less overfitting-prone training set
 - Attribute head, to get a full (not partial) NDS score — see Limitations
 - ByteTrack or SORT tracker on top of the detection head output
@@ -52,10 +53,12 @@ BEVFusion/
 │   │   ├── detection_head.py   # SSD-style cls + reg heads
 │   │   └── pipeline.py         # top-level: camera + LiDAR → fused BEV → heads
 │   ├── cpp/                    # TensorRT inference engine (C++)
-│   │   ├── infer.cpp           # ONNX → .engine build + inference entrypoint
-│   │   ├── camera_pipeline.cpp # camera preprocessing
+│   │   ├── infer.cpp           # engine build/load + full 6-model pipeline
+│   │   ├── geometry.cpp        # LSS get_geometry + voxel_pooling (C++ port)
+│   │   ├── camera_pipeline.cpp # image decode, resize, normalize
 │   │   ├── lidar_pipeline.cpp  # LiDAR preprocessing
 │   │   ├── pillarize.cpp       # pillar tensor construction (C++ port)
+│   │   ├── test_geometry.cpp   # geometry/pooling parity check vs PyTorch
 │   │   └── CMakeLists.txt
 │   └── util.py                 # IoU and shared utilities
 ├── scripts/
@@ -65,10 +68,13 @@ BEVFusion/
 │   ├── train.py                # training loop, anchor matching, focal loss, CBGS sampling
 │   ├── test.py                 # inference, NMS, height-colored BEV GIF
 │   ├── eval.py                 # official nuScenes mAP/NDS evaluation
-│   └── export_onnx.py          # export each sub-model to ONNX for the C++ engine
+│   ├── export_onnx.py          # export sub-models to ONNX with trained weights
+│   ├── dump_sample.py          # dump one sample + reference tensors for the C++ engine
+│   └── compare_cpp.py          # diff C++ engine stages against PyTorch
 ├── engines/                     # exported .onnx + built .engine files
 ├── checkpoints/                 # saved training checkpoints
 ├── eval_results/                # eval.py submissions + metrics
+├── data/                        # sample + reference tensors (dump_sample.py)
 └── images/                      # saved visualizations
 ```
 
@@ -96,13 +102,45 @@ python scripts/test.py [ckpt]    # inference + BEV visualization GIF
 Requires a TensorRT install and the CUDA toolkit (see `src/cpp/CMakeLists.txt` for the expected TensorRT path — update it to match your install).
 
 ```bash
-cd src/cpp
-cmake -S . -B build && cmake --build build
-python ../../scripts/export_onnx.py     # produces engines/*.onnx
-LD_LIBRARY_PATH=/path/to/TensorRT/lib ./build/infer   # builds engines/*.engine from the ONNX files on first run
+cmake -S src/cpp -B src/cpp/build && cmake --build src/cpp/build
+
+python scripts/export_onnx.py [ckpt]   # engines/*.onnx, weights from a trained checkpoint
+python scripts/dump_sample.py [idx]    # data/ — one sample + PyTorch reference tensors
+
+# Builds engines/*.engine from the ONNX files on first run, then runs the
+# full 6-model pipeline and prints decoded detections.
+LD_LIBRARY_PATH=/path/to/TensorRT/lib ./src/cpp/build/infer data
 ```
 
 TensorRT's builder loads GPU-arch-specific resource libraries via `dlopen` at runtime, which doesn't go through the normal linker path — `LD_LIBRARY_PATH` needs to include TensorRT's `lib/` directory whenever running the binary, not just at build time.
+
+`export_onnx.py` loads weights from a trained checkpoint (default `checkpoints/bevfusion_epoch10.pt`) and splits the state dict across the six sub-models. Exporting freshly-constructed modules instead would produce engines full of random weights that run fine and detect nothing.
+
+`infer` flags: `--ref-images` swaps the JPEG decode for PyTorch's exact preprocessed images (isolates pipeline correctness from image-decode differences), and `--strict-fp32` clears TensorRT's default TF32 mode. Engines are cached per precision, so the two modes don't share a build.
+
+## C++ engine parity
+
+The engine is validated against PyTorch rather than just checked for "it ran". Two harnesses:
+
+```bash
+./src/cpp/build/test_geometry data   # geometry/pooling port, no TensorRT needed
+./src/cpp/build/infer data --ref-images && python scripts/compare_cpp.py
+```
+
+`test_geometry` checks the two hand-ported stages that have no learned weights — `get_geometry` and `voxel_pooling` — against PyTorch on identical inputs: max abs difference 1.1e-05 and 1.0e-03 respectively.
+
+`compare_cpp.py` diffs all eight pipeline stages. Judged on *relative* error, since later stages carry much larger activations and a fixed absolute threshold would flag harmless drift in big tensors while missing real errors in small ones.
+
+| Mode | Worst relative error | Notes |
+|---|---|---|
+| `--ref-images` (identical inputs) | 5.5e-03 | Pipeline wiring only |
+| default (JPEG decode in C++) | 5.8e-02 | Adds image-decode differences |
+
+With identical inputs every stage lands in a 0.03–0.5% band that neither compounds nor blows up, and the independent LiDAR path shows the same magnitude — the signature of TensorRT choosing different conv kernels and accumulation orders than PyTorch, not a wiring fault. (For contrast: an ImageNet-normalization mismatch caught during this work sat at ~250% relative, a completely different signature.) Disabling TF32 narrows it only slightly, so most of the remainder is ordinary FP32 kernel variation.
+
+The default path adds a larger gap from image preprocessing: stb's JPEG decoder and Catmull-Rom resize don't reproduce libjpeg + PIL's BICUBIC exactly (mean pixel difference 0.12/255, worst case 18/255). This does not change detections — on the validation sample both produce identical detection counts at every score threshold, the top score differs by 0.0019, and 979 of the top 1000 anchors agree.
+
+**Known gap:** the C++ path consumes a pre-aggregated LiDAR point cloud dumped by `dump_sample.py`. The model is trained on 10-sweep aggregated clouds, and that motion-compensated accumulation still lives in Python — a standalone deployment would need it ported to C++.
 
 ## Target performance
 
