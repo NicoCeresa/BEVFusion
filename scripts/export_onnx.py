@@ -24,6 +24,9 @@ from lidar.backbone import PillarBackbone
 from fusion.bev_encoder import BEVEncoder
 from fusion.detection_head import SSD
 
+sys.path.insert(0, str(ROOT / "scripts"))
+from common import default_checkpoint
+
 with open(ROOT / "config.yaml") as f:
     cfg = yaml.safe_load(f)
 
@@ -71,7 +74,7 @@ def export_to_onnx(name, model, example_inputs):
 
 
 if __name__ == "__main__":
-    ckpt_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "checkpoints" / "bevfusion_epoch10.pt"
+    ckpt_path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_checkpoint()
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     print(f"Checkpoint: {ckpt_path.name}")

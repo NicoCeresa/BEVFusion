@@ -25,6 +25,13 @@ EPOCHS = 15
 # tracks mAP on your data.
 EARLY_STOP_PATIENCE = None
 
+# Save a checkpoint every N epochs. Kept frequent on purpose: val loss is too
+# weak a proxy here to pick the best model, so the real selection is running
+# eval.py over several candidates afterwards. The previous interval of 10 left
+# only one intermediate checkpoint in a 15-epoch run, which is why epoch 10 vs
+# 15 was the entire comparison. At ~68 MB each this is cheap.
+CHECKPOINT_EVERY = 3
+
 POS_IOU_THRESH = 0.50
 NEG_IOU_THRESH = 0.35
 
@@ -319,7 +326,7 @@ def train():
             epochs_since_improvement += 1
             print("")
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % CHECKPOINT_EVERY == 0:
             torch.save(model.state_dict(), ckpt_dir / f"bevfusion_epoch{epoch+1}.pt")
 
         if EARLY_STOP_PATIENCE and epochs_since_improvement >= EARLY_STOP_PATIENCE:
@@ -329,7 +336,9 @@ def train():
     torch.save(model.state_dict(), ckpt_dir / f"bevfusion_{EPOCHS}_epochs.pt")
     print(f"Saved final checkpoint → {ckpt_dir}")
     print(f"Best val loss {best_val:.4f} at epoch {best_epoch} → bevfusion_best.pt")
-    print("Note: val loss is a proxy — confirm the pick with scripts/eval.py before shipping one.")
+    print(f"Val loss is a weak proxy for mAP here — pick the real winner by running "
+          f"scripts/eval.py over the bevfusion_epoch*.pt checkpoints (every "
+          f"{CHECKPOINT_EVERY} epochs) rather than trusting bevfusion_best.pt.")
 
 
 if __name__ == "__main__":

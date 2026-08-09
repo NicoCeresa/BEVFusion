@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from dataloader import NuScenesDataset, CAMERAS
-from common import cfg, build_model
+from common import cfg, build_model, default_checkpoint
 
 
 DATA_DIR = ROOT / "data"
@@ -74,7 +74,7 @@ def main(sample_idx=0):
     write_f32(DATA_DIR / "post_trans.bin", sample['post_trans'].numpy())
 
     # ---- reference tensors, captured stage by stage from the PyTorch model ----
-    model = build_model(device, ROOT / "checkpoints" / "bevfusion_epoch10.pt")
+    model = build_model(device, default_checkpoint())
 
     images     = sample['images'].unsqueeze(0).to(device)
     rots       = sample['rots'].unsqueeze(0).to(device)

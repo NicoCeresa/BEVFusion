@@ -70,6 +70,22 @@ def generate_anchors(device: torch.device) -> torch.Tensor:
     return torch.stack(per_anchor, dim=2).view(-1, 7).to(device)  # (H*W*A, 7)
 
 
+def default_checkpoint():
+    """Newest checkpoint in checkpoints/, preferring bevfusion_best.pt.
+
+    Scripts used to hardcode a specific filename, which broke as soon as a
+    checkpoint was renamed or archived.
+    """
+    ckpt_dir = ROOT / "checkpoints"
+    best = ckpt_dir / "bevfusion_best.pt"
+    if best.exists():
+        return best
+    candidates = sorted(ckpt_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
+    return candidates[-1]
+
+
 def build_model(device, ckpt_path=None, eval_mode=True):
     """Construct BEVFusion and optionally load a checkpoint."""
     model = BEVFusion(

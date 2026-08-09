@@ -49,8 +49,7 @@ def resolve_eval_split(nusc):
     moment any of those scenes are missing locally. Registering our own
     intersected split sidesteps that.
     """
-    split_key = 'mini_val' if nusc.version == 'v1.0-mini' else 'val'
-    scene_names = sorted(set(create_splits_scenes()[split_key]) & available_scene_names(nusc))
+    scene_names = sorted(split_scene_names(nusc, 'val'))
 
     splits_path = Path(nusc.dataroot) / nusc.version / 'splits.json'
     with open(splits_path, 'w') as f:
