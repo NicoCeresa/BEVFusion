@@ -13,16 +13,17 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from dataloader import NuScenesDataset
-from train import EPOCHS
 from common import (cfg, BEV_H, BEV_W, X_MIN, X_MAX, Y_MIN, Y_MAX, NUM_CLASSES,
                     NUM_ANCHORS, CLASS_NAMES, generate_anchors, build_model,
-                    split_scene_names)
+                    split_scene_names, default_checkpoint)
 from visualize import lidar_height_rgb
+from tracker import Tracker
 
 SCORE_THRESH   = 0.3
 NMS_IOU_THRESH = 0.3
 CLASS_COLORS   = ['#4488ff', '#44ff88', '#ff4444']
 NUM_SAMPLES    = 10
+TRACK_DT       = 0.5  # nuScenes keyframes are sampled at 2Hz
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +115,7 @@ def box_corners(box):
     return corners @ rot.T + np.array([x, y])
 
 
-def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels, sample_idx):
+def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, pred_ids, gt_boxes, gt_labels, sample_idx):
     """Draws one BEV frame and returns it as a PIL Image."""
     fig, ax = plt.subplots(figsize=(8, 8))
 
@@ -129,11 +130,11 @@ def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, gt_boxes, gt_l
         ax.add_patch(Polygon(corners, fill=False, edgecolor='white',
                              linestyle='--', linewidth=1.5))
 
-    for box, score, label in zip(pred_boxes.numpy(), pred_scores.numpy(), pred_labels.numpy()):
+    for box, score, label, track_id in zip(pred_boxes, pred_scores, pred_labels, pred_ids):
         corners = box_corners(box)
         color   = CLASS_COLORS[int(label)]
         ax.add_patch(Polygon(corners, fill=False, edgecolor=color, linewidth=2.0))
-        ax.text(box[0], box[1], f"{CLASS_NAMES[int(label)]} {score:.2f}",
+        ax.text(box[0], box[1], f"{CLASS_NAMES[int(label)]} #{int(track_id)} {score:.2f}",
                 color=color, fontsize=6, ha='center', va='center')
 
     for name, color in zip(CLASS_NAMES, CLASS_COLORS):
@@ -157,11 +158,7 @@ def test(ckpt_path=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if ckpt_path is None:
-        ckpt_dir = ROOT / "checkpoints"
-        ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
-        if not ckpts:
-            raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
-        ckpt_path = ckpts[-1]
+        ckpt_path = default_checkpoint()
     print(f"Checkpoint: {ckpt_path.name}")
 
     model = build_model(device, ckpt_path)
@@ -184,6 +181,7 @@ def test(ckpt_path=None):
     indices = range(start, min(start + NUM_SAMPLES, len(dataset)))
 
     frames = []
+    tracker = Tracker(dt=TRACK_DT)
 
     for idx in indices:
         sample = dataset[idx]
@@ -208,12 +206,16 @@ def test(ckpt_path=None):
             scores = scores[kept]
             labels = labels[kept]
 
-        print(f"Sample {idx}: {len(boxes)} detections, {len(sample['gt_boxes'])} GT boxes, max score {scores.max().item() if len(scores) else 0.0:.3f}")
+        track_ids, boxes, scores, labels = tracker.update(
+            boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy())
+
+        print(f"Sample {idx}: {len(boxes)} tracked detections, {len(sample['gt_boxes'])} GT boxes, max score {scores.max() if len(scores) else 0.0:.3f}")
         frames.append(render_frame(
             lidar_pts   = sample['lidar_points'].cpu(),
-            pred_boxes  = boxes.cpu(),
-            pred_scores = scores.cpu(),
-            pred_labels = labels.cpu(),
+            pred_boxes  = boxes,
+            pred_scores = scores,
+            pred_labels = labels,
+            pred_ids    = track_ids,
             gt_boxes    = sample['gt_boxes'].cpu(),
             gt_labels   = sample['gt_labels'].cpu(),
             sample_idx  = idx,

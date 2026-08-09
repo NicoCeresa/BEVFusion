@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import test as test_mod  # reuse decode_predictions/nms — must stay in sync with train.py's encoding
 from dataloader import NuScenesDataset
-from common import cfg, NUM_ANCHORS, generate_anchors, build_model, split_scene_names
+from common import cfg, NUM_ANCHORS, generate_anchors, build_model, split_scene_names, default_checkpoint
 
 
 
@@ -140,11 +140,7 @@ def evaluate(ckpt_path=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if ckpt_path is None:
-        ckpt_dir = ROOT / "checkpoints"
-        ckpts = sorted(ckpt_dir.glob(f"*{EPOCHS}*.pt"))
-        if not ckpts:
-            raise FileNotFoundError(f"No checkpoints in {ckpt_dir} — run train.py first.")
-        ckpt_path = ckpts[-1]
+        ckpt_path = default_checkpoint()
     print(f"Checkpoint: {ckpt_path.name}")
 
     model = build_model(device, ckpt_path)

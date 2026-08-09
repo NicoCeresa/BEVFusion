@@ -5,6 +5,7 @@ config*.yaml
 CLAUDE.md
 pyright*
 .vscode/*
+eval_results/
 
 # Dataset — nuScenes is too large for git
 data/

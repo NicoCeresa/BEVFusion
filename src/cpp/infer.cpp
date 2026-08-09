@@ -55,6 +55,7 @@ void save_engine(IHostMemory* serializedModel, const char* outputFile) {
 // deployment, but clearing it is how you tell a real wiring bug apart from
 // ordinary precision drift when validating.
 static bool g_strict_fp32 = false;
+static bool g_bench_int8 = false;
 
 void build_engine(const char* modelFile, const char* outputFile) {
     IBuilder* builder = createInferBuilder(logger);
@@ -304,6 +305,7 @@ int main(int argc, char** argv) {
         // stb-vs-PIL decode differences.
         if (arg == "--ref-images")       use_ref_images = true;
         else if (arg == "--strict-fp32") g_strict_fp32 = true;
+        else if (arg == "--bench-int8")  g_bench_int8 = true;
         else                             data_dir = arg;
     }
     IRuntime* runtime = createInferRuntime(logger);
@@ -389,11 +391,18 @@ int main(int argc, char** argv) {
     std::vector<float> camera_bev = infer(bev_encode, stream, {&pooled})[0];
     std::cout << "bev_encode      -> " << camera_bev.size() << " floats" << std::endl;
 
-    // ---- lidar branch: points -> pillars -> pointnet -> scatter -> backbone ----
+    // ---- lidar branch: sweeps -> motion-compensated cloud -> pillars -> pointnet -> scatter -> backbone ----
     voxel_size vs{VOXEL_X, VOXEL_Y, VOXEL_Z};
     point_cloud_range range{-50.f, 50.f, -50.f, 50.f, -5.f, 3.f};
-    lidar_pillars pillars = run_lidar_pipeline(data_dir + "/LIDAR_TOP.bin", vs, range,
-                                               pts_per_pillar, max_pillars);
+
+    std::vector<sweep_pose> sweep_poses = load_sweep_poses(data_dir + "/lidar_sweep_poses.bin");
+    std::vector<std::string> sweep_paths;
+    for (size_t i = 0; i < sweep_poses.size(); i++)
+        sweep_paths.push_back(data_dir + "/lidar_sweeps/sweep_" + std::to_string(i) + ".bin");
+
+    std::vector<point> lidar_aggregated;
+    lidar_pillars pillars = run_lidar_pipeline_multisweep(sweep_paths, sweep_poses, vs, range,
+                                                          pts_per_pillar, max_pillars, &lidar_aggregated);
     std::cout << "pillarize       -> " << pillars.num_pillars << " pillars";
     if (pillars.num_pillars > max_pillars)
         std::cout << " (truncated to " << max_pillars << ")";
@@ -419,6 +428,15 @@ int main(int argc, char** argv) {
 
     // Dumped so scripts/compare_cpp.py can diff every stage against PyTorch.
     const std::string p = data_dir + "/cpp_";
+    std::vector<float> lidar_aggregated_flat;
+    lidar_aggregated_flat.reserve(lidar_aggregated.size() * 4);
+    for (const point& pt : lidar_aggregated) {
+        lidar_aggregated_flat.push_back(pt.x);
+        lidar_aggregated_flat.push_back(pt.y);
+        lidar_aggregated_flat.push_back(pt.z);
+        lidar_aggregated_flat.push_back(pt.intensity);
+    }
+    write_f32(p + "lidar_aggregated.bin", lidar_aggregated_flat);
     write_f32(p + "cam_input.bin", cam_input);
     write_f32(p + "cam_encode_raw.bin", cam_feats);
     write_f32(p + "voxel_pooled.bin", pooled);
@@ -456,6 +474,45 @@ int main(int argc, char** argv) {
                               std::chrono::steady_clock::now() - t0).count() / iters;
         std::printf("\nengine chain: %.1f ms/frame over %d iters (%s)\n",
                     ms, iters, g_strict_fp32 ? "FP32 strict" : "FP32/TF32");
+    }
+
+    // Optional: cam_encode INT8 (Q/DQ ONNX, see scripts/quantize_int8.py) vs.
+    // this FP32 engine — same input, same timing methodology, plus relative
+    // error against the FP32 engine's own output.
+    if (g_bench_int8) {
+        ICudaEngine* cam_encode_int8 = prepare_engine("cam_encode_int8", runtime);
+        std::vector<float> cam_feats_int8 = infer(cam_encode_int8, stream, {&cam_input})[0];
+
+        float max_abs = 0.0f, max_rel = 0.0f, sum_abs = 0.0f;
+        for (size_t i = 0; i < cam_feats.size(); i++) {
+            float diff = std::abs(cam_feats[i] - cam_feats_int8[i]);
+            float rel  = diff / (std::abs(cam_feats[i]) + 1e-6f);
+            max_abs = std::max(max_abs, diff);
+            max_rel = std::max(max_rel, rel);
+            sum_abs += diff;
+        }
+        std::printf("\ncam_encode INT8 vs FP32: max|diff|=%.4e  max_rel=%.4e  mean|diff|=%.4e\n",
+                    max_abs, max_rel, sum_abs / cam_feats.size());
+
+        const int warmup = 3, iters = 20;
+        for (int i = 0; i < warmup; i++) infer(cam_encode_int8, stream, {&cam_input});
+        cudaStreamSynchronize(stream);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; i++) infer(cam_encode_int8, stream, {&cam_input});
+        cudaStreamSynchronize(stream);
+        const double int8_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0).count() / iters;
+
+        for (int i = 0; i < warmup; i++) infer(cam_encode, stream, {&cam_input});
+        cudaStreamSynchronize(stream);
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; i++) infer(cam_encode, stream, {&cam_input});
+        cudaStreamSynchronize(stream);
+        const double fp32_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t1).count() / iters;
+
+        std::printf("cam_encode timing: FP32 %.2f ms/frame, INT8 %.2f ms/frame (%.2fx)\n",
+                    fp32_ms, int8_ms, fp32_ms / int8_ms);
     }
 
     std::vector<detection> dets = nms(decode(geo, pred_cls, pred_reg));

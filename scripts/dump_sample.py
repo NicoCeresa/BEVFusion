@@ -21,7 +21,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from dataloader import NuScenesDataset, CAMERAS
+from dataloader import NuScenesDataset, CAMERAS, NUM_SWEEPS
 from common import cfg, build_model, default_checkpoint
 
 
@@ -58,13 +58,39 @@ def main(sample_idx=0):
         print(f"  {cam}.jpg")
 
     # The trained model expects the multi-sweep aggregated cloud, not a single
-    # keyframe scan — dumped in nuScenes' 5-float layout (ring=0) so the
+    # keyframe scan. The actual aggregation now happens in C++ (see
+    # lidar_pipeline.cpp's aggregate_multisweep) from the raw sweeps dumped
+    # below; this Python-computed copy is kept only as the numeric reference
+    # for compare_cpp.py, in nuScenes' 5-float layout (ring=0) so the
     # existing C++ load_bin reads it unchanged.
     pts = sample['lidar_points'].numpy()
     padded = np.zeros((pts.shape[0], 5), dtype=np.float32)
     padded[:, :4] = pts
     padded.tofile(DATA_DIR / "LIDAR_TOP.bin")
-    print(f"  LIDAR_TOP.bin                    {pts.shape} (multi-sweep aggregated)")
+    print(f"  LIDAR_TOP.bin                    {pts.shape} (multi-sweep aggregated, Python reference)")
+
+    # Raw per-sweep scans + calibration, so the C++ pipeline can do its own
+    # motion-compensated aggregation instead of depending on the dump above.
+    sweep_dir = DATA_DIR / "lidar_sweeps"
+    shutil.rmtree(sweep_dir, ignore_errors=True)
+    sweep_dir.mkdir()
+
+    poses = []
+    current_sd = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
+    for i in range(NUM_SWEEPS):
+        shutil.copy(Path(nusc.dataroot) / current_sd['filename'], sweep_dir / f"sweep_{i}.bin")
+
+        ego_pose = nusc.get('ego_pose', current_sd['ego_pose_token'])
+        cs       = nusc.get('calibrated_sensor', current_sd['calibrated_sensor_token'])
+        poses.append(ego_pose['translation'] + ego_pose['rotation'] +
+                     cs['translation'] + cs['rotation'])
+
+        if current_sd['prev'] == '':
+            break
+        current_sd = nusc.get('sample_data', current_sd['prev'])
+
+    np.asarray(poses, dtype=np.float32).tofile(DATA_DIR / "lidar_sweep_poses.bin")
+    print(f"  lidar_sweeps/                     {len(poses)} raw sweeps + poses")
 
     print("\nCalibration:")
     write_f32(DATA_DIR / "rots.bin", sample['rots'].numpy())
