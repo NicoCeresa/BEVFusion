@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from fusion.pipeline import BEVFusion, load_checkpoint
-from dataloader import available_scene_names
+from dataloader import available_scene_names, ATTR_NAMES
 
 with open(ROOT / "config.yaml") as f:
     cfg = yaml.safe_load(f)
@@ -47,6 +47,21 @@ ANCHOR_CLASSES = [a[0] for a in ANCHORS]
 ANCHOR_Z       = -1.0
 
 CLASS_NAMES = ['car', 'pedestrian', 'bicycle']
+
+NUM_ATTRS = len(ATTR_NAMES)
+# class_idx -> (start, end) slice into ATTR_NAMES. Tied to ATTR_NAMES' fixed
+# class-contiguous ordering (see dataloader.py) — car/pedestrian/bicycle each
+# map to a disjoint attribute set, so every anchor's home class (ANCHOR_CLASSES)
+# determines a static logit slice with no dynamic per-anchor lookup needed.
+ATTR_CLASS_RANGES = {0: (0, 3), 1: (3, 6), 2: (6, 8)}
+
+
+def anchor_home_classes(device: torch.device) -> torch.Tensor:
+    """(BEV_H*BEV_W*NUM_ANCHORS,) — the fixed template class of each anchor
+    slot, tiled across the grid. Shared by train.py's build_targets (target
+    assignment) and test.py's decode (attribute slicing) so the two can't
+    silently drift apart."""
+    return torch.tensor(ANCHOR_CLASSES * (BEV_H * BEV_W), device=device)
 
 
 def generate_anchors(device: torch.device) -> torch.Tensor:
@@ -93,6 +108,7 @@ def build_model(device, ckpt_path=None, eval_mode=True):
         grid_conf     = GRID_CONF,
         data_aug_conf = DATA_AUG_CONF,
         num_anchors   = NUM_ANCHORS,
+        num_attrs     = NUM_ATTRS,
     ).to(device)
     if ckpt_path is not None:
         load_checkpoint(model, ckpt_path, device)

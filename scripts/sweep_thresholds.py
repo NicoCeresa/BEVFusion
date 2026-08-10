@@ -46,25 +46,29 @@ def cache_candidates(model, dataset, nusc, anchors, device):
         sample_token = nusc.sample[idx]['token']
         sample = dataset[i]
 
-        images     = sample['images'].unsqueeze(0).to(device)
-        rots       = sample['rots'].unsqueeze(0).to(device)
-        trans      = sample['trans'].unsqueeze(0).to(device)
-        intrins    = sample['intrins'].unsqueeze(0).to(device)
-        post_rots  = sample['post_rots'].unsqueeze(0).to(device)
-        post_trans = sample['post_trans'].unsqueeze(0).to(device)
-        points     = sample['lidar_points'].to(device)
+        images        = sample['images'].unsqueeze(0).to(device)
+        rots          = sample['rots'].unsqueeze(0).to(device)
+        trans         = sample['trans'].unsqueeze(0).to(device)
+        intrins       = sample['intrins'].unsqueeze(0).to(device)
+        post_rots     = sample['post_rots'].unsqueeze(0).to(device)
+        post_trans    = sample['post_trans'].unsqueeze(0).to(device)
+        points        = sample['lidar_points'].to(device)
+        prev          = {k: (v.unsqueeze(0).to(device) if k != 'lidar_points' else v.to(device))
+                         for k, v in sample['prev'].items()}
+        ego_transform = sample['ego_transform'].unsqueeze(0).to(device)
+        has_prev      = sample['has_prev'].unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred_cls, pred_reg = model(images, rots, trans, intrins,
-                                       post_rots, post_trans, points)
-        boxes, scores, labels = test_mod.decode_predictions(pred_cls, pred_reg, anchors)
+            pred_cls, pred_reg, pred_attr = model(images, rots, trans, intrins, post_rots, post_trans,
+                                                   points, prev, ego_transform, has_prev)
+        boxes, scores, labels, attrs = test_mod.decode_predictions(pred_cls, pred_reg, pred_attr, anchors)
 
         lidar_data = nusc.get('sample_data', nusc.sample[idx]['data']['LIDAR_TOP'])
         ego_pose   = nusc.get('ego_pose', lidar_data['ego_pose_token'])
 
         cache.append({
             'sample_token': sample_token,
-            'boxes': boxes.cpu(), 'scores': scores.cpu(), 'labels': labels.cpu(),
+            'boxes': boxes.cpu(), 'scores': scores.cpu(), 'labels': labels.cpu(), 'attrs': attrs.cpu(),
             'ego_t': np.array(ego_pose['translation']),
             'ego_r': eval_mod.Quaternion(ego_pose['rotation']),
         })
@@ -78,20 +82,20 @@ def build_submission_from_cache(cache, score_thresh, nms_iou, max_boxes_per_samp
     test_mod.NMS_IOU_THRESH = nms_iou
     results = {}
     for entry in cache:
-        boxes, scores, labels = entry['boxes'], entry['scores'], entry['labels']
+        boxes, scores, labels, attrs = entry['boxes'], entry['scores'], entry['labels'], entry['attrs']
         keep = scores > score_thresh
-        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+        boxes, scores, labels, attrs = boxes[keep], scores[keep], labels[keep], attrs[keep]
 
         if len(boxes) > 0:
             kept = eval_mod.fast_nms(boxes, scores)
-            boxes, scores, labels = boxes[kept], scores[kept], labels[kept]
+            boxes, scores, labels, attrs = boxes[kept], scores[kept], labels[kept], attrs[kept]
 
         if len(boxes) > max_boxes_per_sample:
             top = scores.argsort(descending=True)[:max_boxes_per_sample]
-            boxes, scores, labels = boxes[top], scores[top], labels[top]
+            boxes, scores, labels, attrs = boxes[top], scores[top], labels[top], attrs[top]
 
         entries = []
-        for box, score, label in zip(boxes.numpy(), scores.numpy(), labels.numpy()):
+        for box, score, label, attr in zip(boxes.numpy(), scores.numpy(), labels.numpy(), attrs.numpy()):
             xyz, size, rot, vel = eval_mod.ego_to_global(box, entry['ego_t'], entry['ego_r'])
             entries.append({
                 'sample_token':    entry['sample_token'],
@@ -101,7 +105,7 @@ def build_submission_from_cache(cache, score_thresh, nms_iou, max_boxes_per_samp
                 'velocity':        vel.tolist(),
                 'detection_name':  eval_mod.OUR_CLASSES[int(label)],
                 'detection_score': float(score),
-                'attribute_name':  '',
+                'attribute_name':  eval_mod.ATTR_NAMES[int(attr)],
             })
         results[entry['sample_token']] = entries
     return results
@@ -152,21 +156,21 @@ def sweep(ckpt_path=None):
             mAP = float(np.mean(list(aps.values())))
 
             tp_scores = []
-            for metric_name in ['trans_err', 'scale_err', 'orient_err', 'vel_err']:
+            for metric_name in ['trans_err', 'scale_err', 'orient_err', 'vel_err', 'attr_err']:
                 per_class = {c: metrics.get_label_tp(c, metric_name) for c in eval_mod.OUR_CLASSES}
                 mean_err = float(np.mean(list(per_class.values())))
                 tp_scores.append(max(0.0, 1.0 - mean_err))
-            partial_nds = (det_cfg.mean_ap_weight * mAP + sum(tp_scores)) / (det_cfg.mean_ap_weight + len(tp_scores))
+            nds = (det_cfg.mean_ap_weight * mAP + sum(tp_scores)) / (det_cfg.mean_ap_weight + len(tp_scores))
 
-            rows.append((score_thresh, nms_iou, mAP, partial_nds, n_boxes))
-            print(f"  score>{score_thresh:.2f} nms={nms_iou:.2f}  mAP={mAP:.4f}  PartialNDS={partial_nds:.4f}  boxes={n_boxes}")
+            rows.append((score_thresh, nms_iou, mAP, nds, n_boxes))
+            print(f"  score>{score_thresh:.2f} nms={nms_iou:.2f}  mAP={mAP:.4f}  NDS={nds:.4f}  boxes={n_boxes}")
 
     rows.sort(key=lambda r: r[3], reverse=True)
     print("\n" + "=" * 60)
-    print("Top 5 by Partial NDS:")
+    print("Top 5 by NDS (3-class):")
     print("=" * 60)
-    for score_thresh, nms_iou, mAP, partial_nds, n_boxes in rows[:5]:
-        print(f"  score>{score_thresh:.2f} nms={nms_iou:.2f}  mAP={mAP:.4f}  PartialNDS={partial_nds:.4f}  boxes={n_boxes}")
+    for score_thresh, nms_iou, mAP, nds, n_boxes in rows[:5]:
+        print(f"  score>{score_thresh:.2f} nms={nms_iou:.2f}  mAP={mAP:.4f}  NDS={nds:.4f}  boxes={n_boxes}")
 
 
 if __name__ == "__main__":

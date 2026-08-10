@@ -12,9 +12,10 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from dataloader import NuScenesDataset
+from dataloader import NuScenesDataset, ATTR_NAMES
 from common import (cfg, BEV_H, BEV_W, X_MIN, X_MAX, Y_MIN, Y_MAX, NUM_CLASSES,
-                    NUM_ANCHORS, CLASS_NAMES, generate_anchors, build_model,
+                    NUM_ANCHORS, NUM_ATTRS, ATTR_CLASS_RANGES, CLASS_NAMES,
+                    anchor_home_classes, generate_anchors, build_model,
                     split_scene_names, default_checkpoint)
 from visualize import lidar_height_rgb
 from tracker import Tracker
@@ -45,30 +46,45 @@ def decode_reg(anchors, reg):
     return torch.stack([x, y, z, w, l, h, theta, vx, vy], dim=1)
 
 
-def decode_predictions(pred_cls, pred_reg, anchors):
+def decode_predictions(pred_cls, pred_reg, pred_attr, anchors):
     """
-    pred_cls: (1, A*C, H, W)
-    pred_reg: (1, A*9, H, W)
-    Returns boxes (N, 9), scores (N,), labels (N,) — all above SCORE_THRESH.
+    pred_cls:  (1, A*C, H, W)
+    pred_reg:  (1, A*9, H, W)
+    pred_attr: (1, A*num_attrs, H, W)
+    Returns boxes (N, 9), scores (N,), labels (N,), attrs (N,) — all above SCORE_THRESH.
     """
     cls_scores = torch.sigmoid(pred_cls[0]).permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES)
     reg_preds  = pred_reg[0].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 9)
+    attr_preds = pred_attr[0].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_ATTRS)
 
     scores, labels = cls_scores.max(dim=-1)   # (H, W, A)
     keep = scores > SCORE_THRESH
 
     if not keep.any():
         empty = torch.zeros(0)
-        return torch.zeros(0, 9), empty, empty.long()
+        return torch.zeros(0, 9), empty, empty.long(), empty.long()
 
     anchors_grid  = anchors.view(BEV_H, BEV_W, NUM_ANCHORS, 7)
     kept_anchors  = anchors_grid[keep]
     kept_reg      = reg_preds[keep]
     kept_scores   = scores[keep]
     kept_labels   = labels[keep]
+    kept_attr     = attr_preds[keep]  # (K, NUM_ATTRS)
 
     boxes = decode_reg(kept_anchors, kept_reg)
-    return boxes, kept_scores, kept_labels
+
+    # Each anchor's *home* class (its fixed template class, not the predicted
+    # label) picks the attribute slice — build_targets only ever supervised
+    # the home-class slice for a given anchor slot.
+    home_classes = anchor_home_classes(anchors.device).view(BEV_H, BEV_W, NUM_ANCHORS)[keep]
+    attrs = torch.zeros(len(kept_scores), dtype=torch.long)
+    for cls_label, (start, end) in ATTR_CLASS_RANGES.items():
+        mask = home_classes == cls_label
+        if mask.any():
+            local = kept_attr[mask][:, start:end].argmax(dim=-1)
+            attrs[mask] = local + start
+
+    return boxes, kept_scores, kept_labels, attrs
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +131,7 @@ def box_corners(box):
     return corners @ rot.T + np.array([x, y])
 
 
-def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, pred_ids, gt_boxes, gt_labels, sample_idx):
+def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, pred_ids, pred_attrs, gt_boxes, gt_labels, sample_idx):
     """Draws one BEV frame and returns it as a PIL Image."""
     fig, ax = plt.subplots(figsize=(8, 8))
 
@@ -130,11 +146,11 @@ def render_frame(lidar_pts, pred_boxes, pred_scores, pred_labels, pred_ids, gt_b
         ax.add_patch(Polygon(corners, fill=False, edgecolor='white',
                              linestyle='--', linewidth=1.5))
 
-    for box, score, label, track_id in zip(pred_boxes, pred_scores, pred_labels, pred_ids):
+    for box, score, label, track_id, attr in zip(pred_boxes, pred_scores, pred_labels, pred_ids, pred_attrs):
         corners = box_corners(box)
         color   = CLASS_COLORS[int(label)]
         ax.add_patch(Polygon(corners, fill=False, edgecolor=color, linewidth=2.0))
-        ax.text(box[0], box[1], f"{CLASS_NAMES[int(label)]} #{int(track_id)} {score:.2f}",
+        ax.text(box[0], box[1], f"{CLASS_NAMES[int(label)]} #{int(track_id)} {score:.2f}\n{ATTR_NAMES[int(attr)]}",
                 color=color, fontsize=6, ha='center', va='center')
 
     for name, color in zip(CLASS_NAMES, CLASS_COLORS):
@@ -186,28 +202,33 @@ def test(ckpt_path=None):
     for idx in indices:
         sample = dataset[idx]
 
-        images     = sample['images'].unsqueeze(0).to(device)
-        rots       = sample['rots'].unsqueeze(0).to(device)
-        trans      = sample['trans'].unsqueeze(0).to(device)
-        intrins    = sample['intrins'].unsqueeze(0).to(device)
-        post_rots  = sample['post_rots'].unsqueeze(0).to(device)
-        post_trans = sample['post_trans'].unsqueeze(0).to(device)
-        points     = sample['lidar_points'].to(device)
+        images        = sample['images'].unsqueeze(0).to(device)
+        rots          = sample['rots'].unsqueeze(0).to(device)
+        trans         = sample['trans'].unsqueeze(0).to(device)
+        intrins       = sample['intrins'].unsqueeze(0).to(device)
+        post_rots     = sample['post_rots'].unsqueeze(0).to(device)
+        post_trans    = sample['post_trans'].unsqueeze(0).to(device)
+        points        = sample['lidar_points'].to(device)
+        prev          = {k: (v.unsqueeze(0).to(device) if k != 'lidar_points' else v.to(device))
+                         for k, v in sample['prev'].items()}
+        ego_transform = sample['ego_transform'].unsqueeze(0).to(device)
+        has_prev      = sample['has_prev'].unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred_cls, pred_reg = model(images, rots, trans, intrins,
-                                       post_rots, post_trans, points)
+            pred_cls, pred_reg, pred_attr = model(images, rots, trans, intrins, post_rots, post_trans,
+                                                   points, prev, ego_transform, has_prev)
 
-        boxes, scores, labels = decode_predictions(pred_cls, pred_reg, anchors)
+        boxes, scores, labels, attrs = decode_predictions(pred_cls, pred_reg, pred_attr, anchors)
 
         if len(boxes) > 0:
             kept   = nms(boxes, scores)
             boxes  = boxes[kept]
             scores = scores[kept]
             labels = labels[kept]
+            attrs  = attrs[kept]
 
-        track_ids, boxes, scores, labels = tracker.update(
-            boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy())
+        track_ids, boxes, scores, labels, attrs = tracker.update(
+            boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy(), attrs.cpu().numpy())
 
         print(f"Sample {idx}: {len(boxes)} tracked detections, {len(sample['gt_boxes'])} GT boxes, max score {scores.max() if len(scores) else 0.0:.3f}")
         frames.append(render_frame(
@@ -216,6 +237,7 @@ def test(ckpt_path=None):
             pred_scores = scores,
             pred_labels = labels,
             pred_ids    = track_ids,
+            pred_attrs  = attrs,
             gt_boxes    = sample['gt_boxes'].cpu(),
             gt_labels   = sample['gt_labels'].cpu(),
             sample_idx  = idx,

@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from dataloader import NuScenesDataset, collate_fn, CLASS_MAP
 from common import (cfg, BEV_H, BEV_W, NUM_CLASSES, NUM_ANCHORS, ANCHOR_CLASSES,
+                    NUM_ATTRS, ATTR_CLASS_RANGES, anchor_home_classes,
                     generate_anchors, build_model, split_scene_names)
 
 EPOCHS = 15
@@ -93,26 +94,31 @@ def encode_reg(anchors: torch.Tensor, gt_box: torch.Tensor) -> torch.Tensor:
 # Target assignment
 # ---------------------------------------------------------------------------
 
-def build_targets(anchors, gt_boxes, gt_labels, device):
+def build_targets(anchors, gt_boxes, gt_labels, gt_attrs, device):
     """
     Match GT boxes to anchors via IoU and build training targets.
 
     Returns:
-        cls_targets (H, W, A, C)  — binary per-class labels
-        reg_targets (H, W, A, 9)  — encoded box deltas (only valid at pos anchors)
-        pos_mask    (H, W, A)     — True where anchor matched a GT box
-        loss_mask   (H, W, A)     — True for pos + neg anchors (ignore ambiguous)
+        cls_targets  (H, W, A, C)  — binary per-class labels
+        reg_targets  (H, W, A, 9)  — encoded box deltas (only valid at pos anchors)
+        attr_targets (H, W, A)     — local attribute index within the anchor's
+                                      home-class range (ATTR_CLASS_RANGES), or
+                                      -1 where no attribute applies (not a
+                                      positive anchor, or the GT box had none)
+        pos_mask     (H, W, A)     — True where anchor matched a GT box
+        loss_mask    (H, W, A)     — True for pos + neg anchors (ignore ambiguous)
     """
     N = BEV_H * BEV_W * NUM_ANCHORS
-    cls_targets = torch.zeros(N, NUM_CLASSES, device=device)
-    reg_targets = torch.zeros(N, 9, device=device)
-    pos_mask    = torch.zeros(N, dtype=torch.bool, device=device)
-    neg_mask    = torch.ones(N, dtype=torch.bool, device=device)
+    cls_targets  = torch.zeros(N, NUM_CLASSES, device=device)
+    reg_targets  = torch.zeros(N, 9, device=device)
+    attr_targets = torch.full((N,), -1, dtype=torch.long, device=device)
+    pos_mask     = torch.zeros(N, dtype=torch.bool, device=device)
+    neg_mask     = torch.ones(N, dtype=torch.bool, device=device)
 
     # (N,) — which class each anchor slot belongs to
-    anchor_classes = torch.tensor(ANCHOR_CLASSES * (BEV_H * BEV_W), device=device)
+    anchor_classes = anchor_home_classes(device)
 
-    for box, label in zip(gt_boxes, gt_labels):
+    for box, label, attr in zip(gt_boxes, gt_labels, gt_attrs):
         box = box.to(device)
         cls_label = label.item()
 
@@ -130,12 +136,17 @@ def build_targets(anchors, gt_boxes, gt_labels, device):
 
         cls_targets[pos, cls_label] = 1.0
         reg_targets[pos] = encode_reg(anchors[pos], box)
+        attr_label = attr.item()
+        if attr_label != -1:
+            start, _ = ATTR_CLASS_RANGES[cls_label]
+            attr_targets[pos] = attr_label - start
         pos_mask[pos] = True
         neg_mask[pos] = False
 
     return (
         cls_targets.view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES),
         reg_targets.view(BEV_H, BEV_W, NUM_ANCHORS, 9),
+        attr_targets.view(BEV_H, BEV_W, NUM_ANCHORS),
         pos_mask.view(BEV_H, BEV_W, NUM_ANCHORS),
         (pos_mask | neg_mask).view(BEV_H, BEV_W, NUM_ANCHORS),
     )
@@ -153,26 +164,32 @@ def focal_loss(pred, target, gamma=2.0, alpha=0.25):
     return alpha_t * (1 - p_t) ** gamma * ce
 
 
-def compute_loss(pred_cls, pred_reg, gt_boxes_batch, gt_labels_batch, anchors):
+def compute_loss(pred_cls, pred_reg, pred_attr, gt_boxes_batch, gt_labels_batch, gt_attrs_batch, anchors):
     """
-    pred_cls: (B, A*C, H, W)
-    pred_reg: (B, A*7, H, W)
-    gt_boxes_batch, gt_labels_batch: lists of length B
+    pred_cls:  (B, A*C, H, W)
+    pred_reg:  (B, A*9, H, W)
+    pred_attr: (B, A*num_attrs, H, W)
+    gt_boxes_batch, gt_labels_batch, gt_attrs_batch: lists of length B
     """
     device = pred_cls.device
     B = pred_cls.shape[0]
-    cls_loss_total = torch.tensor(0.0, device=device)
-    reg_loss_total = torch.tensor(0.0, device=device)
-    num_pos = 0
+    cls_loss_total  = torch.tensor(0.0, device=device)
+    reg_loss_total  = torch.tensor(0.0, device=device)
+    attr_loss_total = torch.tensor(0.0, device=device)
+    num_pos      = 0
+    num_attr_pos = 0
+
+    home_class = anchor_home_classes(device).view(BEV_H, BEV_W, NUM_ANCHORS)
 
     for b in range(B):
-        cls_targets, reg_targets, pos_mask, loss_mask = build_targets(
-            anchors, gt_boxes_batch[b], gt_labels_batch[b], device
+        cls_targets, reg_targets, attr_targets, pos_mask, loss_mask = build_targets(
+            anchors, gt_boxes_batch[b], gt_labels_batch[b], gt_attrs_batch[b], device
         )
 
         # (A*C, H, W) → (H, W, A, C)
-        cls_pred = pred_cls[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES)
-        reg_pred = pred_reg[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 9)
+        cls_pred  = pred_cls[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_CLASSES)
+        reg_pred  = pred_reg[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, 9)
+        attr_pred = pred_attr[b].permute(1, 2, 0).view(BEV_H, BEV_W, NUM_ANCHORS, NUM_ATTRS)
 
         cls_loss_total += (focal_loss(cls_pred, cls_targets) * CLASS_WEIGHTS.to(device))[loss_mask].sum()
 
@@ -182,8 +199,21 @@ def compute_loss(pred_cls, pred_reg, gt_boxes_batch, gt_labels_batch, anchors):
             )
             num_pos += pos_mask.sum().item()
 
+        # Grouped by the 3 distinct classes (not the 5 anchor slots) — car's
+        # two rotation variants share one attribute range, bicycle's two share
+        # another. Anchors with no attribute target (non-positive, or a
+        # positive whose GT box had none) are excluded via attr_targets==-1.
+        for cls_label, (start, end) in ATTR_CLASS_RANGES.items():
+            mask = pos_mask & (home_class == cls_label) & (attr_targets != -1)
+            if mask.any():
+                attr_loss_total += F.cross_entropy(
+                    attr_pred[mask][:, start:end], attr_targets[mask], reduction='sum'
+                )
+                num_attr_pos += mask.sum().item()
+
     norm = max(num_pos, 1)
-    return cls_loss_total / norm, reg_loss_total / norm
+    attr_norm = max(num_attr_pos, 1)
+    return cls_loss_total / norm, reg_loss_total / norm, attr_loss_total / attr_norm
 
 
 # ---------------------------------------------------------------------------
@@ -262,24 +292,31 @@ def train():
 
     for epoch in tqdm(range(EPOCHS), desc="Epochs"):
         model.train()
-        t_cls = t_reg = 0.0
+        t_cls = t_reg = t_attr = 0.0
 
         for batch in tqdm(train_loader, desc="train", leave=False):
 
-            images     = batch['images'].to(device)
-            rots       = batch['rots'].to(device)
-            trans      = batch['trans'].to(device)
-            intrins    = batch['intrins'].to(device)
-            post_rots  = batch['post_rots'].to(device)
-            post_trans = batch['post_trans'].to(device)
-            points     = batch['lidar_points'][0].to(device)   # single sample (batch_size=1)
-            gt_boxes   = batch['gt_boxes']
-            gt_labels  = batch['gt_labels']
+            images        = batch['images'].to(device)
+            rots          = batch['rots'].to(device)
+            trans         = batch['trans'].to(device)
+            intrins       = batch['intrins'].to(device)
+            post_rots     = batch['post_rots'].to(device)
+            post_trans    = batch['post_trans'].to(device)
+            points        = batch['lidar_points'][0].to(device)   # single sample (batch_size=1)
+            prev          = {k: (v.to(device) if k != 'lidar_points' else v[0].to(device))
+                             for k, v in batch['prev'].items()}
+            ego_transform = batch['ego_transform'].to(device)
+            has_prev      = batch['has_prev'].to(device)
+            gt_boxes      = batch['gt_boxes']
+            gt_labels     = batch['gt_labels']
+            gt_attrs      = batch['gt_attrs']
 
             with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-                pred_cls, pred_reg = model(images, rots, trans, intrins, post_rots, post_trans, points)
-                cls_loss, reg_loss = compute_loss(pred_cls, pred_reg, gt_boxes, gt_labels, anchors)
-                loss = cls_loss + reg_loss
+                pred_cls, pred_reg, pred_attr = model(images, rots, trans, intrins, post_rots, post_trans,
+                                                       points, prev, ego_transform, has_prev)
+                cls_loss, reg_loss, attr_loss = compute_loss(pred_cls, pred_reg, pred_attr,
+                                                              gt_boxes, gt_labels, gt_attrs, anchors)
+                loss = cls_loss + reg_loss + attr_loss
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -288,33 +325,42 @@ def train():
 
             t_cls += cls_loss.item()
             t_reg += reg_loss.item()
+            t_attr += attr_loss.item()
 
         n = len(train_loader)
-        print(f"Epoch {epoch:3d} | train cls {t_cls/n:.4f}  reg {t_reg/n:.4f}", end="")
+        print(f"Epoch {epoch:3d} | train cls {t_cls/n:.4f}  reg {t_reg/n:.4f}  attr {t_attr/n:.4f}", end="")
 
         model.eval()
-        v_cls = v_reg = 0.0
+        v_cls = v_reg = v_attr = 0.0
 
         with torch.no_grad():
             for batch in val_loader:
-                images     = batch['images'].to(device)
-                rots       = batch['rots'].to(device)
-                trans      = batch['trans'].to(device)
-                intrins    = batch['intrins'].to(device)
-                post_rots  = batch['post_rots'].to(device)
-                post_trans = batch['post_trans'].to(device)
-                points     = batch['lidar_points'][0].to(device)
-                gt_boxes   = batch['gt_boxes']
-                gt_labels  = batch['gt_labels']
+                images        = batch['images'].to(device)
+                rots          = batch['rots'].to(device)
+                trans         = batch['trans'].to(device)
+                intrins       = batch['intrins'].to(device)
+                post_rots     = batch['post_rots'].to(device)
+                post_trans    = batch['post_trans'].to(device)
+                points        = batch['lidar_points'][0].to(device)
+                prev          = {k: (v.to(device) if k != 'lidar_points' else v[0].to(device))
+                                 for k, v in batch['prev'].items()}
+                ego_transform = batch['ego_transform'].to(device)
+                has_prev      = batch['has_prev'].to(device)
+                gt_boxes      = batch['gt_boxes']
+                gt_labels     = batch['gt_labels']
+                gt_attrs      = batch['gt_attrs']
 
-                pred_cls, pred_reg = model(images, rots, trans, intrins, post_rots, post_trans, points)
-                cls_loss, reg_loss = compute_loss(pred_cls, pred_reg, gt_boxes, gt_labels, anchors)
+                pred_cls, pred_reg, pred_attr = model(images, rots, trans, intrins, post_rots, post_trans,
+                                                       points, prev, ego_transform, has_prev)
+                cls_loss, reg_loss, attr_loss = compute_loss(pred_cls, pred_reg, pred_attr,
+                                                              gt_boxes, gt_labels, gt_attrs, anchors)
                 v_cls += cls_loss.item()
                 v_reg += reg_loss.item()
+                v_attr += attr_loss.item()
 
         m = len(val_loader)
-        val_total = v_cls / m + v_reg / m
-        print(f"  |  val cls {v_cls/m:.4f}  reg {v_reg/m:.4f}  total {val_total:.4f}", end="")
+        val_total = v_cls / m + v_reg / m + v_attr / m
+        print(f"  |  val cls {v_cls/m:.4f}  reg {v_reg/m:.4f}  attr {v_attr/m:.4f}  total {val_total:.4f}", end="")
 
         # Overfitting sets in well before the final epoch on this dataset, so
         # the last checkpoint is not the one you want — track the best.

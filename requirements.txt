@@ -6,3 +6,4 @@ open3d==0.19.0
 einops==0.8.2
 timm==1.0.28
 efficientnet_pytorch==0.7.1
+nvidia-modelopt==0.45.0

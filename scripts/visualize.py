@@ -119,13 +119,13 @@ def vis_point_pillars(points, images_dir):
              images_dir / "point_pillars_output.png")
 
 
-def vis_bevfusion(cam_inputs, points, images_dir):
+def vis_bevfusion(cam_inputs, points, prev_inputs, ego_transform, has_prev, images_dir):
     model = build_model(torch.device('cpu'))
 
     with torch.no_grad():
-        cls, reg = model(*cam_inputs, points)
+        cls, reg, attr = model(*cam_inputs, points, prev_inputs, ego_transform, has_prev)
 
-    print(f"BEVFusion cls: {cls.shape}  reg: {reg.shape}")
+    print(f"BEVFusion cls: {cls.shape}  reg: {reg.shape}  attr: {attr.shape}")
     save_bev(cls[0].max(dim=0).values.numpy(), "Fused BEV Output",
              images_dir / "bevfusion_output.png")
 
@@ -171,6 +171,21 @@ def main():
         item['post_trans'].unsqueeze(0),
     ) if needs_camera else None
 
+    # nusc.sample[0] is the first sample overall, so item['prev'] almost
+    # certainly duplicates the current frame with a zero ego_transform (see
+    # dataloader.py's scene-start fallback) — expected here, not a bug.
+    prev_inputs = {
+        'images':       item['prev']['images'].unsqueeze(0),
+        'rots':         item['prev']['rots'].unsqueeze(0),
+        'trans':        item['prev']['trans'].unsqueeze(0),
+        'intrins':      item['prev']['intrins'].unsqueeze(0),
+        'post_rots':    item['prev']['post_rots'].unsqueeze(0),
+        'post_trans':   item['prev']['post_trans'].unsqueeze(0),
+        'lidar_points': item['prev']['lidar_points'],
+    } if needs_camera or needs_lidar else None
+    ego_transform = item['ego_transform'].unsqueeze(0)
+    has_prev      = item['has_prev'].unsqueeze(0)
+
     if needs_lidar:
         print(f"LiDAR points: {points.shape}")
 
@@ -183,7 +198,7 @@ def main():
     if run_all or args.point_pillars:
         vis_point_pillars(points, images_dir)
     if run_all or args.bevfusion:
-        vis_bevfusion(cam_inputs, points, images_dir)
+        vis_bevfusion(cam_inputs, points, prev_inputs, ego_transform, has_prev, images_dir)
 
 
 if __name__ == "__main__":

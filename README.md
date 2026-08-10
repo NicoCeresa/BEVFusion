@@ -30,9 +30,9 @@ Both modalities are projected into a shared Bird's Eye View (BEV) space before f
 - ~~Multi-sweep LiDAR aggregation in C++~~ — done, see [C++ engine parity](#c-engine-parity); surfaced a separate `MAX_PILLARS` truncation gap on dense scenes, documented there
 - Automatic best-checkpoint selection in `train.py` based on validation metrics, rather than picking one manually with `eval.py` afterwards
 - Pull additional nuScenes trainval blob parts (currently training on 1 of ~10, 85 of 850 scenes) for a larger, less overfitting-prone training set
-- Attribute head, to get a full (not partial) NDS score — see Limitations
+- ~~Attribute head, to get a full (not partial) NDS score~~ — implemented (`SSD.attr_head`, `scripts/dataloader.py`'s `ATTR_NAMES`/`ATTR_MAP`), verified end-to-end, **not retrained to convergence** — see Limitations
 - ~~ByteTrack or SORT tracker on top of the detection head output~~ — done, see [Detection Output](#detection-output)'s Tracking note; `scripts/tracker.py`
-- Temporal BEV fusion — even just stacking 2-3 past BEV frames as input channels is a meaningful step, and you can cite BEVFormer as motivation
+- ~~Temporal BEV fusion (1 past frame)~~ — implemented (`src/fusion/temporal_fusion.py`, ego-motion `grid_sample` warp), verified end-to-end, **not retrained to convergence** — see Limitations
 
 ## Project structure
 
@@ -50,7 +50,8 @@ BEVFusion/
 │   │   └── point_pillars.py    # full LiDAR branch orchestrator
 │   ├── fusion/
 │   │   ├── bev_encoder.py      # concatenate + conv neck
-│   │   ├── detection_head.py   # SSD-style cls + reg heads
+│   │   ├── detection_head.py   # SSD-style cls + reg + attr heads
+│   │   ├── temporal_fusion.py  # ego-motion warp + fuse with the prior keyframe's BEV
 │   │   └── pipeline.py         # top-level: camera + LiDAR → fused BEV → heads
 │   ├── cpp/                    # TensorRT inference engine (C++)
 │   │   ├── infer.cpp           # engine build/load + full 6-model pipeline
@@ -144,9 +145,22 @@ The default path adds a larger gap from image preprocessing: stb's JPEG decoder 
 
 **Known gap:** `pointnet`'s ONNX export fixes the pillar-tensor shape at `MAX_PILLARS=10000` (`export_onnx.py`), but PyTorch itself has no such cap. Found while validating the port above: a densely-populated sample (10 full sweeps, ~265k points) produced 15,493 occupied pillars, and truncating to 10,000 for the fixed-shape engine input diverged sharply from the PyTorch reference (`lidar_bev` relative error 0.88, vs. <0.2% on a low-density sample) — the C++ path silently drops ~5,500 real pillars in dense scenes rather than raising an error. A fix would mean re-exporting `pointnet`/`pillar_backbone` at a higher `MAX_PILLARS` (or dynamic axes) and rebuilding those two engines.
 
+**INT8 quantization** — TensorRT 11 removed the classic calibrator API entirely (no `BuilderFlag::kINT8`, no `IInt8Calibrator`); quantization now means baking `QuantizeLinear`/`DequantizeLinear` (Q/DQ) nodes into the ONNX graph before TensorRT ever sees it, which it then parses natively. `scripts/quantize_int8.py` does this for `cam_encode` via `nvidia-modelopt`, as a proof of concept:
+
+- Calibrates on 32 real training samples (activation ranges from actual data, not random tensors), using modelopt's default max-calibration INT8 config.
+- Requires registering a custom `QuantConv2dStaticSamePadding` wrapper for `efficientnet_pytorch`'s conv class — modelopt only auto-wraps plain `nn.Conv2d`/`nn.Linear`, and silently quantized *nothing in the EfficientNet backbone* without it (caught by checking the quantizer summary: only the hand-written `up1`/`depthnet` head lit up, 116 quantizers instead of the 278 once the backbone is actually covered).
+- Requires `torch.onnx.export(..., dynamo=False)` — torch's newer dynamo-based exporter can't trace modelopt's fake-quant modules (their calibrated scale/amax are lifted as dynamic constants, which trips `torch.export`'s fake-tensor checks).
+- Result (`--bench-int8`): **1.30x faster** (221.0 → 170.3 ms/frame) with mean absolute output error 0.014 against the FP32 engine, and the one detection on the validation sample is essentially unchanged (score 0.316→0.317, same box). A very large *relative* error also shows up, but — same signature documented above for the JPEG-decode/TF32 comparisons — that's a near-zero FP32 denominator inflating the ratio on a handful of values, not a sign of broken calibration.
+
+Deliberately not extended to the other five sub-models: 1.3x is a real but modest win (Q/DQ boundary overhead eats into the theoretical INT8 gain), this model's bottleneck has never been inference speed, and each remaining sub-model would likely need its own round of the same discovery work (whatever custom layer types it uses). The toolchain is proven; scaling it up is future work if latency ever actually becomes the constraint.
+
+**Known gap: attribute head + temporal fusion are PyTorch-only.** Both were added for architectural fidelity to the paper (see Limitations for why no retrain was run). `infer.cpp`/`export_onnx.py` stay single-frame by design — `TemporalFusion` has no ONNX export path at all, so the C++ engine never sees a second frame or the ego-motion warp. The attribute head is lower-effort to close: `export_onnx.py` already passes `num_attrs` into `SSD`, so its ONNX graph *does* gain a 3rd output tensor, but `infer.cpp` only reads `head_out[0]`/`head_out[1]` positionally — wiring up `head_out[2]` is a small, well-scoped follow-up whenever a retrained checkpoint exists to export.
+
 ## Target performance
 
 The published numbers below (full nuScenes trainval, ~700 scenes, 20 epochs with CBGS) and what this implementation has actually measured are kept separate — this project trains on a small fraction of that data for far fewer epochs, so the gap is expected, not a bug.
+
+The measured numbers and GIF below are from `bevfusion_epoch12.pt`, which **predates the attribute head and temporal fusion** described in Limitations — they're the most recent numbers that actually exist, still accurate for the architecture they describe, but not from the current code.
 
 ### Published (BEVFusion paper, full nuScenes val)
 
@@ -158,7 +172,7 @@ The published numbers below (full nuScenes trainval, ~700 scenes, 20 epochs with
 
 ### Measured (this implementation)
 
-Evaluated with `eval.py` (official nuScenes devkit metrics) on 914 val samples from 23 scenes — the val portion of 1 of ~10 trainval blob parts (85 of 850 scenes total downloaded so far). NDS here is a *partial* score (mAP + ATE/ASE/AOE/AVE, excluding AAE since there's no attribute head — see Limitations), so it isn't directly comparable to the published NDS above.
+Evaluated with `eval.py` (official nuScenes devkit metrics) on 914 val samples from 23 scenes — the val portion of 1 of ~10 trainval blob parts (85 of 850 scenes total downloaded so far). NDS here is a *partial* score (mAP + ATE/ASE/AOE/AVE, excluding AAE) since `bevfusion_epoch12.pt` predates the attribute head — see Limitations. `eval.py` itself has since been updated to report the real AAE/full 3-class NDS for any checkpoint trained with the current code.
 
 | Checkpoint | Resolution | mAP | Partial NDS | Notes |
 |---|---|---|---|---|
@@ -296,6 +310,12 @@ LSS merges `reduction_5` (what a pixel means — semantic richness, broad contex
 **Checkpoint selection** — validation loss is a weak proxy for measured mAP/NDS on this dataset, and the two 15-epoch runs so far failed in different ways. At 128×352, validation loss bottomed around epoch 4-5 and pedestrian AP collapsed to zero real matches by epoch 15 — classic overfitting, with the intermediate `bevfusion_epoch10.pt` clearly beating the final checkpoint. At 256×704, there was no collapse at all: epochs 3 and 6 are simply dead (no real matches yet), something crosses over between epoch 6 and 9, and epochs 9/12/15 are then statistically flat. Neither pattern would have been caught by watching validation loss alone (see `train.py`'s `EARLY_STOP_PATIENCE` comment, which walks through why it's disabled), and the best checkpoint by validation loss (`bevfusion_best.pt`'s original pick, epoch 1) was nowhere near the actual best by measured NDS in either run. `train.py` saves a checkpoint every `CHECKPOINT_EVERY` epochs specifically so `eval.py` can be run across several candidates rather than trusting any loss-based proxy.
 
 **Resolution vs. dataset size** — retraining at 256×704 (~4x the camera pixels of the original 128×352 setup, 8h40m to train) produced no measurable improvement: best Partial NDS went from 0.0517 to 0.0519, a difference within noise. Per-class TP errors show a genuine mix of small gains and losses rather than a systematic improvement (car's translation and velocity error both improved; its orientation error got measurably worse). With the same ~2,462 training samples either way, input resolution isn't the bottleneck — see [Target performance](#target-performance).
+
+**Attribute head + temporal fusion are implemented but not retrained.** Both were added for architectural fidelity to the BEVFusion paper: a third `SSD` head (`attr_head`) predicting nuScenes attributes (car↔moving/parked/stopped, pedestrian↔moving/sitting/standing, bicycle↔with_rider/without_rider), and a `TemporalFusion` module (`src/fusion/temporal_fusion.py`) that runs the whole camera+LiDAR+BEV pipeline a second time on the prior keyframe, warps it into the current ego frame via `grid_sample` (ego-motion transform verified by visually aligning two consecutive frames' raw LiDAR height-maps before wiring it in), and concatenates it with the current frame's BEV before the head. Both are verified end-to-end — a full forward+backward pass and a real 1-epoch run over the whole training set produced finite, sane losses (cls 462→2.0, reg 1.6→2.0, attr 0.8→0.8, train→val) with no crashes.
+
+The full 15-epoch retrain needed to actually evaluate these was deliberately **not run**: it directly doubles most of the per-sample cost (the camera+LiDAR encoders and the dominant `LidarPointCloud.from_file_multisweep` I/O cost both run twice per sample now), pushing the existing 8h40m baseline toward roughly 15 hours, and the resolution finding directly above is the reason that's not a good trade right now — this project's binding constraint is training-data scale (~2,462 samples, ~1/11th of the paper's), and there's no reason to expect architecture changes to move the score when a 4x resolution increase already didn't. These two additions are offered as "matches the paper's design," not as a claimed score improvement.
+
+Practical consequence: **existing checkpoints (`bevfusion_epoch12.pt` and everything else in `checkpoints/`) predate this change and will not load** — `SSD` now returns 3 outputs instead of 2, so `load_checkpoint` raises a clear `RuntimeError` listing the missing `head.attr_head.*`/`temporal_fusion.*` keys rather than loading silently and misbehaving. The measured numbers and GIF below are from `bevfusion_epoch12.pt` on the pre-attribute-head/pre-temporal-fusion architecture — the most recent numbers that actually exist — and remain accurate for the architecture they describe. Running `test.py`/`eval.py`/`export_onnx.py` against the current code requires retraining first.
 
 **Post-processing has no headroom left** — `scripts/sweep_thresholds.py` grid-searched score threshold (0.05–0.6) x NMS IoU (0.1–0.7) against `bevfusion_epoch12.pt` on the full 914-sample val set, re-using a single cached forward pass per sample so only the decode/NMS/eval step reran per combination. NMS IoU turned out to be irrelevant (0.0519–0.0520 across the whole 0.1–0.7 range). Score threshold is worse than irrelevant: raising it from the current default of 0.05 to just 0.08 collapses Partial NDS to exactly 0.0000 — every TP metric for every class drops below nuScenes' 10%-recall floor simultaneously, and mAP stays at 0.0000 across all 50 combinations regardless of threshold or NMS setting. The real detections and the false-positive noise occupy the same narrow confidence band (~0.05–0.08); there's no score gap a threshold could exploit. This confirms the near-zero mAP is a model-calibration/dataset-scale problem, not a tunable post-processing setting — `test.py`/`eval.py`'s current defaults are already at the peak of what this checkpoint can do.
 

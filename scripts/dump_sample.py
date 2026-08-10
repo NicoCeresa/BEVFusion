@@ -135,12 +135,17 @@ def main(sample_idx=0):
         lidar_bev = model.lidar_encoder(points)
         write_f32(DATA_DIR / "ref_lidar_bev.bin", lidar_bev.cpu().numpy())
 
+        # Deliberately stays on this pre-TemporalFusion, single-frame path —
+        # it calls camera_encoder/lidar_encoder/bev_encoder/head directly,
+        # matching the C++ engine's scope (temporal fusion is PyTorch-only,
+        # see README's C++ engine parity section).
         fused = model.bev_encoder(camera_bev, lidar_bev)
         write_f32(DATA_DIR / "ref_fused_bev.bin", fused.cpu().numpy())
 
-        pred_cls, pred_reg = model.head(fused)
+        pred_cls, pred_reg, pred_attr = model.head(fused)
         write_f32(DATA_DIR / "ref_pred_cls.bin", pred_cls.cpu().numpy())
         write_f32(DATA_DIR / "ref_pred_reg.bin", pred_reg.cpu().numpy())
+        write_f32(DATA_DIR / "ref_pred_attr.bin", pred_attr.cpu().numpy())
 
     print(f"\nWrote sample + reference tensors to {DATA_DIR}")
 

@@ -34,6 +34,20 @@ CLASS_MAP = {
     'vehicle.bicycle':              2,
 }
 
+# nuScenes ties valid attributes to detection class (see
+# nuscenes/eval/detection/algo.py::detection_name_to_rel_attributes) — car's
+# category maps only to vehicle.*, pedestrian's only to pedestrian.*,
+# bicycle's only to cycle.*, with no overlap. Ordered class-contiguously
+# (car=[0:3), pedestrian=[3:6), bicycle=[6:8)) so a class's attribute range is
+# a fixed slice — see common.py's ATTR_CLASS_RANGES, which depends on this
+# exact ordering.
+ATTR_NAMES = [
+    'vehicle.moving', 'vehicle.parked', 'vehicle.stopped',
+    'pedestrian.moving', 'pedestrian.sitting_lying_down', 'pedestrian.standing',
+    'cycle.with_rider', 'cycle.without_rider',
+]
+ATTR_MAP = {name: i for i, name in enumerate(ATTR_NAMES)}
+
 POINT_CLOUD_RANGE = ((-50.0, 50.0), (-50.0, 50.0), (-5.0, 3.0))
 
 
@@ -75,7 +89,36 @@ class NuScenesDataset(Dataset):
 
         images, rots, trans, intrins, post_rots, post_trans = self._load_cameras(sample)
         lidar_points = self._load_lidar(sample)
-        gt_boxes, gt_labels = self._load_annotations(sample)
+        gt_boxes, gt_labels, gt_attrs = self._load_annotations(sample)
+
+        # Temporal fusion needs one prior keyframe, motion-compensated into
+        # the current ego frame. At a scene's first sample there's no prior
+        # keyframe (sample['prev'] == '') — reuse the current frame as its
+        # own "prev" with a zero transform rather than skipping the sample
+        # or feeding zeros: a real (duplicated) BEV keeps the temporal
+        # fusion module's BatchNorm statistics in-distribution, and this way
+        # every caller (train/eval/sweep/visualize) gets identical, free
+        # scene-start behavior instead of reimplementing this per script.
+        has_prev = sample['prev'] != ''
+        if has_prev:
+            prev_sample = self.nusc.get('sample', sample['prev'])
+            (prev_images, prev_rots, prev_trans,
+             prev_intrins, prev_post_rots, prev_post_trans) = self._load_cameras(prev_sample)
+            prev_lidar_points = self._load_lidar(prev_sample)
+
+            ego_t_cur,  ego_r_cur  = self._ego_pose(sample)
+            ego_t_prev, ego_r_prev = self._ego_pose(prev_sample)
+            # Same idiom _load_annotations uses for global->ego (rotate the
+            # translation difference, compose the rotations) — just applied
+            # to two ego poses instead of an ego pose and an annotation.
+            dx, dy = ego_r_cur.inverse.rotate(ego_t_prev - ego_t_cur)[:2]
+            dyaw = (ego_r_cur.inverse * ego_r_prev).yaw_pitch_roll[0]
+            ego_transform = torch.tensor([dx, dy, dyaw], dtype=torch.float)
+        else:
+            (prev_images, prev_rots, prev_trans,
+             prev_intrins, prev_post_rots, prev_post_trans) = images, rots, trans, intrins, post_rots, post_trans
+            prev_lidar_points = lidar_points
+            ego_transform = torch.zeros(3)
 
         return {
             'images':       images,        # (N, 3, H, W)
@@ -85,9 +128,29 @@ class NuScenesDataset(Dataset):
             'post_rots':    post_rots,     # (N, 3, 3)
             'post_trans':   post_trans,    # (N, 3)
             'lidar_points': lidar_points,  # (P, 4) — variable length per sample
+            'prev': {
+                'images':       prev_images,
+                'rots':         prev_rots,
+                'trans':        prev_trans,
+                'intrins':      prev_intrins,
+                'post_rots':    prev_post_rots,
+                'post_trans':   prev_post_trans,
+                'lidar_points': prev_lidar_points,
+            },
+            'ego_transform': ego_transform,   # (3,) — dx, dy, dyaw: prev ego frame relative to current
+            'has_prev':      torch.tensor(has_prev),
             'gt_boxes':     gt_boxes,      # (M, 9) — variable length per sample
             'gt_labels':    gt_labels,     # (M,)
+            'gt_attrs':     gt_attrs,      # (M,) — -1 where no attribute annotation exists
         }
+
+    def _ego_pose(self, sample):
+        """Global-frame ego pose (translation, rotation) at a sample's LIDAR_TOP
+        timestamp — used only for the temporal-fusion ego-motion transform above;
+        _load_annotations fetches this itself for its own (unrelated) purpose."""
+        lidar_data = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        ego_pose = self.nusc.get('ego_pose', lidar_data['ego_pose_token'])
+        return np.array(ego_pose['translation']), Quaternion(ego_pose['rotation'])
 
     def _load_cameras(self, sample):
         images, rots, trans, intrins = [], [], [], []
@@ -134,7 +197,7 @@ class NuScenesDataset(Dataset):
         ego_t       = np.array(ego_pose['translation'])
         ego_r       = Quaternion(ego_pose['rotation'])
 
-        boxes, labels = [], []
+        boxes, labels, attrs = [], [], []
 
         for ann_token in sample['anns']:
             ann = self.nusc.get('sample_annotation', ann_token)
@@ -159,18 +222,29 @@ class NuScenesDataset(Dataset):
             boxes.append([x, y, z, w, l, h, yaw, vx, vy])
             labels.append(CLASS_MAP[category])
 
+            # ~0.4% of annotations have zero attribute_tokens (nuScenes docs);
+            # -1 is an ignore sentinel, matching how the devkit's own attr_acc
+            # ignores empty ground-truth attributes rather than scoring them wrong.
+            attr_tokens = ann['attribute_tokens']
+            if attr_tokens:
+                attr_name = self.nusc.get('attribute', attr_tokens[0])['name']
+                attrs.append(ATTR_MAP.get(attr_name, -1))
+            else:
+                attrs.append(-1)
+
         if boxes:
             return (
                 torch.tensor(boxes, dtype=torch.float),  # (M, 9)
                 torch.tensor(labels, dtype=torch.long),  # (M,)
+                torch.tensor(attrs, dtype=torch.long),   # (M,)
             )
-        return torch.zeros(0, 9), torch.zeros(0, dtype=torch.long)
+        return torch.zeros(0, 9), torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)
 
 
 def collate_fn(batch):
     """
-    Custom collate for variable-length lidar_points, gt_boxes, gt_labels.
-    Fixed-size camera tensors are stacked; variable-length fields are kept as lists.
+    Custom collate for variable-length lidar_points, gt_boxes, gt_labels, gt_attrs.
+    Fixed-size camera/prev/ego_transform tensors are stacked; variable-length fields are kept as lists.
     """
     return {
         'images':       torch.stack([b['images'] for b in batch]),       # (B, N, 3, H, W)
@@ -180,6 +254,18 @@ def collate_fn(batch):
         'post_rots':    torch.stack([b['post_rots'] for b in batch]),    # (B, N, 3, 3)
         'post_trans':   torch.stack([b['post_trans'] for b in batch]),   # (B, N, 3)
         'lidar_points': [b['lidar_points'] for b in batch],              # list of (P_i, 4)
+        'prev': {
+            'images':       torch.stack([b['prev']['images'] for b in batch]),
+            'rots':         torch.stack([b['prev']['rots'] for b in batch]),
+            'trans':        torch.stack([b['prev']['trans'] for b in batch]),
+            'intrins':      torch.stack([b['prev']['intrins'] for b in batch]),
+            'post_rots':    torch.stack([b['prev']['post_rots'] for b in batch]),
+            'post_trans':   torch.stack([b['prev']['post_trans'] for b in batch]),
+            'lidar_points': [b['prev']['lidar_points'] for b in batch],
+        },
+        'ego_transform': torch.stack([b['ego_transform'] for b in batch]),  # (B, 3)
+        'has_prev':      torch.stack([b['has_prev'] for b in batch]),       # (B,)
         'gt_boxes':     [b['gt_boxes'] for b in batch],                  # list of (M_i, 9)
         'gt_labels':    [b['gt_labels'] for b in batch],                 # list of (M_i,)
+        'gt_attrs':     [b['gt_attrs'] for b in batch],                  # list of (M_i,)
     }

@@ -2,10 +2,15 @@
 Evaluate a trained checkpoint on nuScenes using the official devkit metrics.
 
 Reports mAP (real, comparable to published baselines) plus the translation/
-scale/orientation/velocity TP errors. mAAE is not reported: this model has no
-attribute head, so submitting attribute_name="" would pin that error term
-near its worst value regardless of detection quality, deflating NDS for
-reasons unrelated to the detector.
+scale/orientation/velocity/attribute TP errors, combined into an NDS
+restricted to this model's 3 classes (car/pedestrian/bicycle). This is *not*
+metrics.nd_score/.mean_ap from the devkit directly — those average over all
+10 official detection_cvpr_2019 classes, and this model only ever predicts 3,
+so the other 7 would silently drag the score down for reasons that have
+nothing to do with this model's actual quality. The manual 3-class
+reconstruction below avoids that dilution; it's still not directly
+comparable to the paper's published full-dataset NDS for the unrelated
+reason of training-data scale (see README's Target performance section).
 """
 import sys
 import json
@@ -23,7 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import test as test_mod  # reuse decode_predictions/nms — must stay in sync with train.py's encoding
-from dataloader import NuScenesDataset
+from dataloader import NuScenesDataset, ATTR_NAMES
 from common import cfg, NUM_ANCHORS, generate_anchors, build_model, split_scene_names, default_checkpoint
 
 
@@ -88,30 +93,36 @@ def build_submission(model, dataset, nusc, anchors, device, max_boxes_per_sample
         sample_token = nusc.sample[idx]['token']
         sample = dataset[i]
 
-        images     = sample['images'].unsqueeze(0).to(device)
-        rots       = sample['rots'].unsqueeze(0).to(device)
-        trans      = sample['trans'].unsqueeze(0).to(device)
-        intrins    = sample['intrins'].unsqueeze(0).to(device)
-        post_rots  = sample['post_rots'].unsqueeze(0).to(device)
-        post_trans = sample['post_trans'].unsqueeze(0).to(device)
-        points     = sample['lidar_points'].to(device)
+        images        = sample['images'].unsqueeze(0).to(device)
+        rots          = sample['rots'].unsqueeze(0).to(device)
+        trans         = sample['trans'].unsqueeze(0).to(device)
+        intrins       = sample['intrins'].unsqueeze(0).to(device)
+        post_rots     = sample['post_rots'].unsqueeze(0).to(device)
+        post_trans    = sample['post_trans'].unsqueeze(0).to(device)
+        points        = sample['lidar_points'].to(device)
+        prev          = {k: (v.unsqueeze(0).to(device) if k != 'lidar_points' else v.to(device))
+                         for k, v in sample['prev'].items()}
+        ego_transform = sample['ego_transform'].unsqueeze(0).to(device)
+        has_prev      = sample['has_prev'].unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred_cls, pred_reg = model(images, rots, trans, intrins,
-                                       post_rots, post_trans, points)
+            pred_cls, pred_reg, pred_attr = model(images, rots, trans, intrins, post_rots, post_trans,
+                                                   points, prev, ego_transform, has_prev)
 
-        boxes, scores, labels = test_mod.decode_predictions(pred_cls, pred_reg, anchors)
+        boxes, scores, labels, attrs = test_mod.decode_predictions(pred_cls, pred_reg, pred_attr, anchors)
         if len(boxes) > 0:
             kept   = fast_nms(boxes, scores)
             boxes  = boxes[kept]
             scores = scores[kept]
             labels = labels[kept]
+            attrs  = attrs[kept]
 
         if len(boxes) > max_boxes_per_sample:
             top    = scores.argsort(descending=True)[:max_boxes_per_sample]
             boxes  = boxes[top]
             scores = scores[top]
             labels = labels[top]
+            attrs  = attrs[top]
 
         lidar_data = nusc.get('sample_data', nusc.sample[idx]['data']['LIDAR_TOP'])
         ego_pose   = nusc.get('ego_pose', lidar_data['ego_pose_token'])
@@ -119,7 +130,8 @@ def build_submission(model, dataset, nusc, anchors, device, max_boxes_per_sample
         ego_r      = Quaternion(ego_pose['rotation'])
 
         entries = []
-        for box, score, label in zip(boxes.cpu().numpy(), scores.cpu().numpy(), labels.cpu().numpy()):
+        for box, score, label, attr in zip(boxes.cpu().numpy(), scores.cpu().numpy(),
+                                            labels.cpu().numpy(), attrs.cpu().numpy()):
             xyz, size, rot, vel = ego_to_global(box, ego_t, ego_r)
             entries.append({
                 'sample_token':    sample_token,
@@ -129,7 +141,7 @@ def build_submission(model, dataset, nusc, anchors, device, max_boxes_per_sample
                 'velocity':        vel.tolist(),
                 'detection_name':  OUR_CLASSES[int(label)],
                 'detection_score': float(score),
-                'attribute_name':  '',
+                'attribute_name':  ATTR_NAMES[int(attr)],
             })
         results[sample_token] = entries
 
@@ -187,16 +199,17 @@ def evaluate(ckpt_path=None):
     print("\nTP errors at dist_th_tp=2m (lower is better):")
     tp_scores = []
     for metric_name, label in [('trans_err', 'ATE (m)'), ('scale_err', 'ASE (1-IOU)'),
-                                ('orient_err', 'AOE (rad)'), ('vel_err', 'AVE (m/s)')]:
+                                ('orient_err', 'AOE (rad)'), ('vel_err', 'AVE (m/s)'),
+                                ('attr_err', 'AAE (1-acc)')]:
         per_class = {c: metrics.get_label_tp(c, metric_name) for c in OUR_CLASSES}
         mean_err  = float(np.mean(list(per_class.values())))
         tp_scores.append(max(0.0, 1.0 - mean_err))
         print(f"  {label:14s} " + ", ".join(f"{c}={v:.3f}" for c, v in per_class.items()) + f"  (mean={mean_err:.3f})")
-    print("  AAE:           N/A — model has no attribute head")
 
-    partial_nds = (det_cfg.mean_ap_weight * mAP + sum(tp_scores)) / (det_cfg.mean_ap_weight + len(tp_scores))
-    print(f"\nPartial NDS (mAP + ATE/ASE/AOE/AVE, excludes AAE): {partial_nds:.4f}")
-    print("(Not directly comparable to published full-NDS numbers, which include the attribute term.)")
+    nds = (det_cfg.mean_ap_weight * mAP + sum(tp_scores)) / (det_cfg.mean_ap_weight + len(tp_scores))
+    print(f"\nNDS (3-class: mAP + ATE/ASE/AOE/AVE/AAE): {nds:.4f}")
+    print("(Restricted to car/pedestrian/bicycle — not directly comparable to the paper's published")
+    print(" full-dataset NDS, which averages over all 10 official classes on ~11x more training data.)")
 
 
 if __name__ == "__main__":

@@ -32,12 +32,13 @@ def iou_bev_matrix(boxes_a, boxes_b):
 class Track:
     _next_id = 1
 
-    def __init__(self, box, score, label):
+    def __init__(self, box, score, label, attr):
         self.id = Track._next_id
         Track._next_id += 1
         self.box   = box.copy()  # (9,) x,y,z,w,l,h,yaw,vx,vy
         self.score = score
         self.label = label
+        self.attr  = attr
         self.hits  = 1
         self.time_since_update = 0
 
@@ -48,8 +49,8 @@ class Track:
         predicted[1] += self.box[8] * dt
         return predicted
 
-    def update(self, box, score, label):
-        self.box, self.score, self.label = box.copy(), score, label
+    def update(self, box, score, label, attr):
+        self.box, self.score, self.label, self.attr = box.copy(), score, label, attr
         self.hits += 1
         self.time_since_update = 0
 
@@ -62,11 +63,11 @@ class Tracker:
         self.dt = dt
         self.tracks = []
 
-    def update(self, boxes, scores, labels):
+    def update(self, boxes, scores, labels, attrs):
         """
-        boxes: (N, 9) numpy array, scores: (N,), labels: (N,) — one frame's
-        detections. Returns (track_ids, boxes, scores, labels) for confirmed
-        tracks only (hits >= MIN_HITS), all numpy arrays.
+        boxes: (N, 9) numpy array, scores/labels/attrs: (N,) — one frame's
+        detections. Returns (track_ids, boxes, scores, labels, attrs) for
+        confirmed tracks only (hits >= MIN_HITS), all numpy arrays.
         """
         predicted = np.stack([t.predict(self.dt) for t in self.tracks]) if self.tracks else np.zeros((0, 9))
 
@@ -76,7 +77,7 @@ class Tracker:
             row_ind, col_ind = linear_sum_assignment(-iou)
             for r, c in zip(row_ind, col_ind):
                 if iou[r, c] >= IOU_MATCH_THRESH:
-                    self.tracks[r].update(boxes[c], scores[c], labels[c])
+                    self.tracks[r].update(boxes[c], scores[c], labels[c], attrs[c])
                     matched_tracks.add(r)
                     matched_dets.add(c)
 
@@ -86,16 +87,17 @@ class Tracker:
 
         for j in range(len(boxes)):
             if j not in matched_dets:
-                self.tracks.append(Track(boxes[j], scores[j], labels[j]))
+                self.tracks.append(Track(boxes[j], scores[j], labels[j], attrs[j]))
 
         self.tracks = [t for t in self.tracks if t.time_since_update <= MAX_AGE]
 
         confirmed = [t for t in self.tracks if t.time_since_update == 0 and t.hits >= MIN_HITS]
         if not confirmed:
-            return (np.zeros(0, dtype=int), np.zeros((0, 9)), np.zeros(0), np.zeros(0, dtype=int))
+            return (np.zeros(0, dtype=int), np.zeros((0, 9)), np.zeros(0), np.zeros(0, dtype=int), np.zeros(0, dtype=int))
         return (
             np.array([t.id for t in confirmed]),
             np.stack([t.box for t in confirmed]),
             np.array([t.score for t in confirmed]),
             np.array([t.label for t in confirmed]),
+            np.array([t.attr for t in confirmed]),
         )

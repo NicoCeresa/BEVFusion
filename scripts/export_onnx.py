@@ -36,9 +36,10 @@ C            = 64
 N_CAMS       = 6
 IMG_H, IMG_W = cfg["camera"]["image_size"]
 BEV_H, BEV_W = 200, 200
-MAX_PILLARS  = 10000 
-MAX_PTS      = 32     
+MAX_PILLARS  = 10000
+MAX_PTS      = 32
 NUM_ANCHORS  = 5
+NUM_ATTRS    = 8
 
 
 # Which checkpoint state_dict prefix feeds each exported sub-model.
@@ -97,7 +98,7 @@ if __name__ == "__main__":
                             (torch.randn(1, 1, BEV_H, BEV_W),
                              torch.randn(1, C * 6, BEV_H, BEV_W))),
 
-        "ssd":             (SSD(in_channels=256, num_classes=3, num_anchors=NUM_ANCHORS),
+        "ssd":             (SSD(in_channels=256, num_classes=3, num_anchors=NUM_ANCHORS, num_attrs=NUM_ATTRS),
                             (torch.randn(1, 256, BEV_H, BEV_W),)),
     }
 

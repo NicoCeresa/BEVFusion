@@ -7,6 +7,7 @@ import torch.nn as nn
 from camera.lss import compile_model
 from lidar.point_pillars import PointPillars
 from fusion.bev_encoder import BEVEncoder
+from fusion.temporal_fusion import TemporalFusion
 from fusion.detection_head import SSD
 
 
@@ -43,7 +44,8 @@ def load_checkpoint(model, path, device):
 class BEVFusion(nn.Module):
     def __init__(self, lss_weights: str, grid_conf: dict, data_aug_conf: dict,
                  lidar_channels: int = 384, camera_channels: int = 1,
-                 fused_channels: int = 256, num_classes: int = 3, num_anchors: int = 2):
+                 fused_channels: int = 256, num_classes: int = 3, num_anchors: int = 2,
+                 num_attrs: int = 8):
         super().__init__()
 
         self.camera_encoder = compile_model(grid_conf, data_aug_conf, outC=camera_channels)
@@ -66,9 +68,22 @@ class BEVFusion(nn.Module):
             out_channels=fused_channels,
         )
 
-        self.head = SSD(in_channels=fused_channels, num_classes=num_classes, num_anchors=num_anchors)
+        self.temporal_fusion = TemporalFusion(
+            channels=fused_channels,
+            xbound=grid_conf['xbound'],
+            ybound=grid_conf['ybound'],
+        )
 
-    def forward(self, images, rots, trans, intrins, post_rots, post_trans, points):
+        self.head = SSD(in_channels=fused_channels, num_classes=num_classes,
+                         num_anchors=num_anchors, num_attrs=num_attrs)
+
+    def _fuse_frame(self, images, rots, trans, intrins, post_rots, post_trans, points):
+        camera_bev = self.camera_encoder(images, rots, trans, intrins, post_rots, post_trans)
+        lidar_bev  = self.lidar_encoder(points)
+        return self.bev_encoder(camera_bev, lidar_bev)
+
+    def forward(self, images, rots, trans, intrins, post_rots, post_trans, points,
+                prev, ego_transform, has_prev):
         """
         images:    (B, N, 3, H, W)
         rots:      (B, N, 3, 3)
@@ -77,13 +92,29 @@ class BEVFusion(nn.Module):
         post_rots: (B, N, 3, 3)
         post_trans:(B, N, 3)
         points:    (N, 4) — x, y, z, intensity
+        prev:      dict with the same 7 keys (images/rots/trans/intrins/
+                   post_rots/post_trans/lidar_points) for the prior keyframe
+        ego_transform: (B, 3) — (dx, dy, dyaw) of prev's ego frame relative to current
+        has_prev:  (B,) bool — False at scene starts (see dataloader.py)
 
-        returns: cls (B, num_anchors * num_classes, H, W)
-                 reg (B, num_anchors * 9, H, W)
+        returns: cls  (B, num_anchors * num_classes, H, W)
+                 reg  (B, num_anchors * 9, H, W)
+                 attr (B, num_anchors * num_attrs, H, W)
         """
-        camera_bev = self.camera_encoder(images, rots, trans, intrins, post_rots, post_trans)
-        lidar_bev  = self.lidar_encoder(points)
-        fused_bev  = self.bev_encoder(camera_bev, lidar_bev)
-        cls, reg   = self.head(fused_bev)
+        fused_t0 = self._fuse_frame(images, rots, trans, intrins, post_rots, post_trans, points)
 
-        return cls, reg
+        # At scene starts dataloader.py already set has_prev=False with prev
+        # duplicating the current frame — running the encoders again on
+        # bit-identical input would waste the single most expensive part of
+        # the forward pass for zero information gain, so skip it.
+        if has_prev.any():
+            fused_t1 = self._fuse_frame(prev['images'], prev['rots'], prev['trans'],
+                                         prev['intrins'], prev['post_rots'], prev['post_trans'],
+                                         prev['lidar_points'])
+        else:
+            fused_t1 = fused_t0
+
+        fused = self.temporal_fusion(fused_t0, fused_t1, ego_transform, has_prev)
+        cls, reg, attr = self.head(fused)
+
+        return cls, reg, attr
